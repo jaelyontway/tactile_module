@@ -158,20 +158,29 @@ class RobomimicForceDataset(Dataset):
         return image.contiguous()
 
     def _load_tactile(self, trajectory, timestep: int) -> torch.Tensor:
-        tactile_np = np.array(self._resolve_dataset(trajectory, self.tactile_key))
-        if tactile_np.ndim == 1:
-            tactile_np = tactile_np[:, None]
+        tactile_dataset = self._resolve_dataset(trajectory, self.tactile_key)
+        try:
+            dataset_shape = tactile_dataset.shape  # type: ignore[attr-defined]
+        except AttributeError:
+            tactile_dataset = np.array(tactile_dataset)
+            dataset_shape = tactile_dataset.shape
 
-        if tactile_np.ndim != 2:
+        if len(dataset_shape) == 3:
+            tactile_slice = np.array(tactile_dataset[timestep])
+        else:
+            window = min(self.tactile_window, dataset_shape[0])
+            start = max(0, timestep + 1 - window)
+            tactile_slice = np.array(tactile_dataset[start : timestep + 1])
+
+        if tactile_slice.ndim == 1:
+            tactile_slice = tactile_slice[:, None]
+
+        if tactile_slice.ndim != 2:
             raise ValueError(
-                f"Expected tactile array with shape (time, channels); received shape {tactile_np.shape}."
+                f"Expected tactile slice with shape (time, channels); received shape {tactile_slice.shape}."
             )
 
-        window = min(self.tactile_window, tactile_np.shape[0])
-        start = max(0, timestep + 1 - window)
-        tactile_window = tactile_np[start : timestep + 1]
-
-        tactile_tensor = torch.from_numpy(tactile_window).float()
+        tactile_tensor = torch.from_numpy(tactile_slice).float()
         if tactile_tensor.size(-1) != self.tactile_channels:
             if tactile_tensor.size(0) == self.tactile_channels:
                 tactile_tensor = tactile_tensor.transpose(0, 1)

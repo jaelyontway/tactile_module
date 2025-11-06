@@ -11,8 +11,8 @@ weight_decay: 1e-2
 num_workers: 0
 checkpoint_path: checkpoints/multimodal_force.pt
 
-dataset_type: dummy
-use_dummy_data: true
+dataset_type: robomimic
+use_dummy_data: false
 dummy_train_size: 512
 dummy_val_size: 128
 dummy_image_size: 224
@@ -20,11 +20,11 @@ dummy_tactile_length: 500
 dummy_seed: 0
 
 robomimic:
-  train_path:
-  val_path:
-  image_key: observations/images/agentview_image
-  tactile_key: observations/tactile
-  force_key: observations/force
+  train_path: ~/multi-modal/data/robomimic/success_2025_11_04.hdf5
+  val_path: ~/multi-modal/data/robomimic/success_2025_11_04.hdf5
+  image_key: obs/wrist_image_left_rgb
+  tactile_key: obs/tactile_values
+  force_key: obs/future_force_prediction
   image_size: 224
   tactile_length: 500
   tactile_window: 500
