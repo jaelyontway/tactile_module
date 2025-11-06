@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -235,6 +236,86 @@ class RobomimicForceDataset(Dataset):
         return len(self._indices)
 
 
+class RegressionMetricAccumulator:
+    """Running accumulator for scalar regression metrics."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.abs_error = 0.0
+        self.sq_error = 0.0
+        self.sum_pred = 0.0
+        self.sum_target = 0.0
+        self.sum_pred_sq = 0.0
+        self.sum_target_sq = 0.0
+        self.sum_prod = 0.0
+
+    def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
+        pred_flat = prediction.detach().reshape(-1)
+        target_flat = target.detach().reshape(-1)
+        diff = pred_flat - target_flat
+
+        self.count += target_flat.numel()
+        self.abs_error += diff.abs().sum().item()
+        self.sq_error += diff.pow(2).sum().item()
+        self.sum_pred += pred_flat.sum().item()
+        self.sum_target += target_flat.sum().item()
+        self.sum_pred_sq += pred_flat.pow(2).sum().item()
+        self.sum_target_sq += target_flat.pow(2).sum().item()
+        self.sum_prod += (pred_flat * target_flat).sum().item()
+
+    def results(self) -> dict[str, float]:
+        if self.count == 0:
+            return {
+                "count": 0.0,
+                "mse": 0.0,
+                "mae": 0.0,
+                "rmse": 0.0,
+                "r2": 0.0,
+                "pearson": 0.0,
+            }
+
+        mse = self.sq_error / self.count
+        mae = self.abs_error / self.count
+        rmse = math.sqrt(mse)
+
+        pred_mean = self.sum_pred / self.count
+        target_mean = self.sum_target / self.count
+        pred_var = max(self.sum_pred_sq / self.count - pred_mean ** 2, 0.0)
+        target_var = max(self.sum_target_sq / self.count - target_mean ** 2, 0.0)
+        ss_tot = self.sum_target_sq - self.count * (target_mean ** 2)
+        r2 = 0.0 if ss_tot <= 1e-12 else 1.0 - self.sq_error / ss_tot
+
+        covariance = self.sum_prod / self.count - pred_mean * target_mean
+        denom = math.sqrt(max(pred_var * target_var, 0.0))
+        pearson = covariance / denom if denom > 1e-12 else 0.0
+        pearson = max(min(pearson, 1.0), -1.0)
+
+        return {
+            "count": float(self.count),
+            "mse": mse,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "pearson": pearson,
+        }
+
+
+def _grad_norm(parameters, norm_type: float = 2.0) -> float:
+    """Compute gradient norm without modifying gradients."""
+    valid_params = [p for p in parameters if p.grad is not None]
+    if not valid_params:
+        return 0.0
+
+    if math.isinf(norm_type):
+        return max(p.grad.detach().abs().max().item() for p in valid_params)
+
+    total = 0.0
+    for param in valid_params:
+        param_norm = param.grad.detach().data.norm(norm_type)
+        total += param_norm.item() ** norm_type
+    return total ** (1.0 / norm_type)
+
+
 def _ensure_tmpdir() -> Optional[Path]:
     candidates = []
     env_tmp = os.environ.get("TMPDIR")
@@ -324,7 +405,7 @@ def load_config(path: Optional[str] = None) -> dict:
     if not isinstance(data, dict):
         raise TypeError(f"Configuration file '{config_path}' must define a top-level mapping.")
 
-    float_keys = {"lr", "weight_decay", "dropout"}
+    float_keys = {"lr", "weight_decay", "dropout", "grad_clip_norm"}
     for key in float_keys:
         if key in data:
             try:
@@ -342,6 +423,22 @@ def train(config):
     model = MultimodalForceTransformer(MultimodalTransformerConfig()).to(device)
     if wandb_module is not None:
         wandb_module.watch(model, log_freq=100, log="all")
+
+    grad_clip_norm = None
+    grad_clip_value = config.get("grad_clip_norm")
+    if grad_clip_value not in (None, "", 0):
+        try:
+            grad_clip_norm = float(grad_clip_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"grad_clip_norm must be numeric, got {grad_clip_value!r}") from exc
+        if grad_clip_norm <= 0:
+            grad_clip_norm = None
+
+    grad_norm_type_value = config.get("grad_norm_type", 2.0)
+    try:
+        grad_norm_type = float(grad_norm_type_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"grad_norm_type must be numeric, got {grad_norm_type_value!r}") from exc
 
     dataset_type = config.get("dataset_type", "dummy").lower()
     logged_messages: set[str] = set()
@@ -477,27 +574,74 @@ def train(config):
 
     for epoch in range(config["epochs"]):
         model.train()
-        epoch_loss = 0.0
+        train_metrics = RegressionMetricAccumulator()
+        grad_norm_sum = 0.0
+        grad_norm_max = 0.0
+        grad_norm_count = 0
+        grad_clip_events = 0
+
         for images, tactile, target in train_loader:
             images, tactile, target = images.to(device), tactile.to(device), target.to(device).float()
             optimizer.zero_grad()
             pred = model(images, tactile).squeeze(-1)
             loss = criterion(pred, target)
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * images.size(0)
 
-        # how well the model fits training data 
-        train_loss = epoch_loss / len(train_loader.dataset)
-        # how well the model generalizes to unseen data 
-        val_loss = evaluate(model, val_loader, criterion, device)
+            grad_norm_count += 1
+            if grad_clip_norm is not None:
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                grad_norm_value = float(total_norm)
+                if grad_norm_value > grad_clip_norm:
+                    grad_clip_events += 1
+            else:
+                grad_norm_value = _grad_norm(model.parameters(), norm_type=grad_norm_type)
+
+            grad_norm_sum += grad_norm_value
+            grad_norm_max = max(grad_norm_max, grad_norm_value)
+
+            optimizer.step()
+            train_metrics.update(pred.detach(), target.detach())
+
+        train_results = train_metrics.results()
+        val_results = evaluate(model, val_loader, criterion, device)
         scheduler.step()
 
+        grad_norm_mean = grad_norm_sum / grad_norm_count if grad_norm_count else 0.0
+        grad_clip_rate = grad_clip_events / grad_norm_count if grad_norm_count else 0.0
+
         if wandb_module is not None:
-            wandb_module.log(
-                {"epoch": epoch, "train/loss": train_loss, "val/loss": val_loss, "lr": scheduler.get_last_lr()[0]}
+            log_payload = {
+                "epoch": epoch,
+                "train/loss": train_results["mse"],
+                "train/mae": train_results["mae"],
+                "train/rmse": train_results["rmse"],
+                "train/r2": train_results["r2"],
+                "train/pearson": train_results["pearson"],
+                "val/loss": val_results["mse"],
+                "val/mae": val_results["mae"],
+                "val/rmse": val_results["rmse"],
+                "val/r2": val_results["r2"],
+                "val/pearson": val_results["pearson"],
+                "lr": scheduler.get_last_lr()[0],
+                "train/grad_norm_mean": grad_norm_mean,
+                "train/grad_norm_max": grad_norm_max,
+                "train/grad_clip_rate": grad_clip_rate,
+            }
+            if grad_clip_norm is not None:
+                log_payload["train/grad_clip_threshold"] = grad_clip_norm
+            wandb_module.log(log_payload)
+
+        clip_msg = ""
+        if grad_clip_norm is not None and grad_norm_count:
+            clip_msg = f" | clip {grad_clip_rate * 100:.1f}%"
+        print(
+            (
+                f"Epoch {epoch:03d}: "
+                f"train mse {train_results['mse']:.4f} mae {train_results['mae']:.4f} "
+                f"| val mse {val_results['mse']:.4f} mae {val_results['mae']:.4f} "
+                f"| grad {grad_norm_mean:.2f}{clip_msg}"
             )
-        print(f"Epoch {epoch:03d}: train {train_loss:.4f} / val {val_loss:.4f}")
+        )
 
     if can_save_checkpoint:
         try:
@@ -513,13 +657,13 @@ def train(config):
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss = 0.0
+    metrics = RegressionMetricAccumulator()
     for images, tactile, target in loader:
         images, tactile, target = images.to(device), tactile.to(device), target.to(device).float()
         pred = model(images, tactile).squeeze(-1)
-        loss = criterion(pred, target)
-        total_loss += loss.item() * images.size(0)
-    return total_loss / len(loader.dataset)
+        _ = criterion(pred, target)  # keep parity with training for potential custom losses
+        metrics.update(pred.detach(), target.detach())
+    return metrics.results()
 
 
 if __name__ == "__main__":

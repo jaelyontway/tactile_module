@@ -1,13 +1,14 @@
 wandb_project: tactile_module
-wandb_experiment: smoke_test
-run_name: smoke_test
+wandb_experiment: smoke_test_2
+run_name: smoke_test_2
 use_wandb: true
-wandb_mode: online
+wandb_mode: online          # set to 'online' when network access is available
 
 batch_size: 16
 epochs: 50
 lr: 1e-4
 weight_decay: 1e-2
+grad_clip_norm: 1.0
 num_workers: 0
 checkpoint_path: checkpoints/multimodal_force.pt
 
@@ -22,12 +23,12 @@ dummy_seed: 0
 robomimic:
   train_path: ~/multi-modal/data/robomimic/success_2025_11_04.hdf5
   val_path: ~/multi-modal/data/robomimic/success_2025_11_04.hdf5
-  image_key: obs/wrist_image_left_rgb
-  tactile_key: obs/tactile_values
-  force_key: obs/force_prediction
-  image_size: 224
-  tactile_length: 500
-  tactile_window: 500
-  tactile_pad_value: 0.0
-  tactile_channels: 6
-  normalize_images: true
+  image_key: obs/wrist_image_left_rgb      # vision stream to feed the image encoder
+  tactile_key: obs/tactile_values          # tactile stream (time, channels) for the tactile encoder
+  force_key: obs/force_prediction          # regression target sampled at each timestep
+  image_size: 224                          # resize frames to a consistent resolution
+  tactile_length: 500                      # final tactile sequence length after pad/truncate
+  tactile_window: 500                      # history window pulled from the raw dataset
+  tactile_pad_value: 0.0                   # pad value when history is shorter than tactile_length
+  tactile_channels: 6                      # expected tactile channel count for input validation
+  normalize_images: true                   # scale uint8 images to [0,1] floats

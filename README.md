@@ -48,6 +48,13 @@ Run the training script with `use_dummy_data=False` in the config to switch to t
 - Use `scripts/train.sh` to launch training without worrying about `PYTHONPATH`; the script forwards any additional CLI arguments to the module entry point.
 - To train on a Robomimic dataset, set `dataset_type: robomimic` and point `robomimic.train_path` / `robomimic.val_path` to the respective `.hdf5` files. Explicitly specify the observation keys (`image_key`, `tactile_key`, `force_key`) so the loader knows which streams to consume.
 - The default configuration targets `~/multi-modal/data/robomimic/success_2025_11_04.hdf5` and uses the wrist camera (`obs/wrist_image_left_rgb`), tactile traces (`obs/tactile_values`), and force predictions (`obs/force_prediction`). Update these entries if you swap in a dataset with different naming.
+- Logged training metrics:
+  - `train/grad_clip_rate`: fraction of updates that triggered gradient clipping; spikes flag potential gradient explosions.
+  - `train/grad_norm_mean` / `train/grad_norm_max`: average and worst gradient norm per epoch; track stability and signal strength.
+  - `train/mae` / `val/mae`: mean absolute error (in force units), an interpretable average deviation.
+  - `train/rmse` / `val/rmse`: root mean square error, more sensitive to large mistakes than MAE.
+  - `train/r2` / `val/r2`: coefficient of determination; 1.0 indicates perfect fit, 0 matches a constant baseline, negative is worse than baseline.
+  - `train/pearson` / `val/pearson`: Pearson correlation between predictions and ground truth, highlighting whether trends align.
 
 ## Model Usage
 ```python
