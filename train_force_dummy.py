@@ -500,6 +500,12 @@ def train(config):
         wandb_module.watch(model, log_freq=100, log="all")
 
     dataset_type = config.get("dataset_type", "dummy").lower()
+    logged_messages: set[str] = set()
+
+    def log_once(identifier: str, message: str) -> None:
+        if identifier not in logged_messages:
+            print(message)
+            logged_messages.add(identifier)
 
     def build_dataset(split: str):
         if dataset_type == "robomimic":
@@ -558,7 +564,7 @@ def train(config):
                 raise ValueError(f"Invalid robomimic.tactile_channels value: {tactile_channels_value!r}") from exc
             normalize_images = bool(dataset_cfg.get("normalize_images", True))
 
-            return RobomimicForceDataset(
+            dataset = RobomimicForceDataset(
                 hdf5_path=hdf5_path,
                 image_key=image_key,
                 tactile_key=tactile_key,
@@ -570,6 +576,14 @@ def train(config):
                 image_size=image_size,
                 normalize_images=normalize_images,
             )
+            log_once(
+                f"robomimic-{split}",
+                (
+                    f"[train] Using Robomimic dataset ({split}) from {dataset.hdf5_path} "
+                    f"(image='{dataset.image_key}', tactile='{dataset.tactile_key}', force='{dataset.force_key}')"
+                ),
+            )
+            return dataset
 
         use_dummy = (
             config.get("use_dummy_data", False)
@@ -579,16 +593,26 @@ def train(config):
         if not use_dummy:
             if ForceDataset is None:
                 raise RuntimeError("ForceDataset is unavailable. Enable 'use_dummy_data' or provide an implementation.")
-            return ForceDataset(split=split)
+            dataset = ForceDataset(split=split)
+            log_once(f"external-{split}", "[train] Using user-provided ForceDataset implementation.")
+            return dataset
 
         length = config["dummy_train_size"] if split == "train" else config["dummy_val_size"]
-        return DummyForceDataset(
+        dataset = DummyForceDataset(
             split=split,
             length=length,
             image_size=config["dummy_image_size"],
             tactile_len=config["dummy_tactile_length"],
             seed=config.get("dummy_seed", 0),
         )
+        log_once(
+            f"dummy-{split}",
+            (
+                f"[train] Using dummy dataset ({split}) with length={length}, "
+                f"image_size={config['dummy_image_size']}, tactile_len={config['dummy_tactile_length']}."
+            ),
+        )
+        return dataset
 
     train_loader = DataLoader(
         build_dataset("train"),
