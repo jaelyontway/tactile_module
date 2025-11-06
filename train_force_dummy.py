@@ -1,3 +1,4 @@
+import argparse
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -120,6 +121,35 @@ def _initialize_wandb(config) -> Optional[Any]:
     return wandb
 
 
+def load_config(path: Optional[str] = None) -> dict:
+    """
+    Load configuration from a YAML file.
+
+    Args:
+        path: Optional path supplied by the caller. When absent, defaults to configs/default.yaml.
+    """
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - dependency expected via requirements
+        raise RuntimeError(
+            "PyYAML is required to load configuration files. Install it via `pip install pyyaml`."
+        ) from exc
+
+    default_path = Path(__file__).resolve().parent / "configs" / "default.yaml"
+    config_path = Path(path).expanduser() if path else default_path
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file '{config_path}' not found.")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+
+    if not isinstance(data, dict):
+        raise TypeError(f"Configuration file '{config_path}' must define a top-level mapping.")
+
+    return data
+
+
 def train(config):
     wandb_module = _initialize_wandb(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -211,24 +241,14 @@ def evaluate(model, loader, criterion, device):
 
 
 if __name__ == "__main__":
-    default_config = {
-        "wandb_project": "grasp-force",
-        "wandb_experiment": "baseline",
-        "run_name": "baseline",
-        "batch_size": 16,
-        "epochs": 50,
-        "lr": 1e-4,
-        "weight_decay": 1e-2,
-        "num_workers": 4,
-        "checkpoint_path": "checkpoints/multimodal_force.pt",
-        "use_wandb": True,
-        "wandb_mode": "offline",
-        # Dummy data controls
-        "use_dummy_data": True,
-        "dummy_train_size": 512,
-        "dummy_val_size": 128,
-        "dummy_image_size": 224,
-        "dummy_tactile_length": 500,
-        "dummy_seed": 0,
-    }
-    train(default_config)
+    parser = argparse.ArgumentParser(description="Train the multimodal force prediction model.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a YAML config file (defaults to configs/default.yaml).",
+    )
+    args = parser.parse_args()
+
+    configuration = load_config(args.config)
+    train(configuration)

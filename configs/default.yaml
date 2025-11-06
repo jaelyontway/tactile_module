@@ -1,0 +1,19 @@
+wandb_project: grasp-force
+wandb_experiment: baseline
+run_name: baseline
+use_wandb: true
+wandb_mode: offline
+
+batch_size: 16
+epochs: 50
+lr: 1e-4
+weight_decay: 1e-2
+num_workers: 4
+checkpoint_path: checkpoints/multimodal_force.pt
+
+use_dummy_data: true
+dummy_train_size: 512
+dummy_val_size: 128
+dummy_image_size: 224
+dummy_tactile_length: 500
+dummy_seed: 0
