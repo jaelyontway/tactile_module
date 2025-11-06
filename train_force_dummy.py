@@ -147,6 +147,14 @@ def load_config(path: Optional[str] = None) -> dict:
     if not isinstance(data, dict):
         raise TypeError(f"Configuration file '{config_path}' must define a top-level mapping.")
 
+    float_keys = {"lr", "weight_decay", "dropout"}
+    for key in float_keys:
+        if key in data:
+            try:
+                data[key] = float(data[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"Configuration value for '{key}' must be numeric, got {data[key]!r}.") from None
+
     return data
 
 
@@ -210,7 +218,9 @@ def train(config):
             optimizer.step()
             epoch_loss += loss.item() * images.size(0)
 
+        # how well the model fits training data 
         train_loss = epoch_loss / len(train_loader.dataset)
+        # how well the model generalizes to unseen data 
         val_loss = evaluate(model, val_loader, criterion, device)
         scheduler.step()
 
