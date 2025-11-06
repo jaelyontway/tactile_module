@@ -45,6 +45,7 @@ Run the training script with `use_dummy_data=False` in the config to switch to t
 ## Configuration
 - Edit `configs/default.yaml` to change hyperparameters, logging options, or dataset settings. For example, updating `wandb_experiment` or `batch_size` in the YAML file automatically applies to the next training run.
 - Override the path at runtime with `python -m tactile_module.train_force_dummy --config path/to/custom.yaml`.
+- Use `scripts/train.sh` to launch training without worrying about `PYTHONPATH`; the script forwards any additional CLI arguments to the module entry point.
 
 ## Model Usage
 ```python
