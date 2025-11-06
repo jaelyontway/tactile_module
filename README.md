@@ -46,8 +46,8 @@ Run the training script with `use_dummy_data=False` in the config to switch to t
 - Edit `configs/default.yaml` to change hyperparameters, logging options, or dataset settings. For example, updating `wandb_experiment` or `batch_size` in the YAML file automatically applies to the next training run.
 - Override the path at runtime with `python -m tactile_module.train_force_dummy --config path/to/custom.yaml`.
 - Use `scripts/train.sh` to launch training without worrying about `PYTHONPATH`; the script forwards any additional CLI arguments to the module entry point.
-- To train on a Robomimic dataset, set `dataset_type: robomimic` and point `robomimic.train_path` / `robomimic.val_path` to the respective `.hdf5` files. Key names (`image_key`, `tactile_key`, `force_key`) are optional—leave them blank to let the loader auto-detect suitable datasets from the file, or override them when you need a specific stream.
-- The default configuration already targets `~/multi-modal/data/robomimic/success_2025_11_04.hdf5`; image/tactile/force streams are auto-discovered from that file. Update the paths or explicitly set keys if you switch to a dataset with different naming conventions.
+- To train on a Robomimic dataset, set `dataset_type: robomimic` and point `robomimic.train_path` / `robomimic.val_path` to the respective `.hdf5` files. Explicitly specify the observation keys (`image_key`, `tactile_key`, `force_key`) so the loader knows which streams to consume.
+- The default configuration targets `~/multi-modal/data/robomimic/success_2025_11_04.hdf5` and uses the wrist camera (`obs/wrist_image_left_rgb`), tactile traces (`obs/tactile_values`), and force predictions (`obs/force_prediction`). Update these entries if you swap in a dataset with different naming.
 
 ## Model Usage
 ```python
