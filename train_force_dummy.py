@@ -109,7 +109,11 @@ def _initialize_wandb(config) -> Optional[Any]:
         return None
 
     try:
-        wandb.init(project=config["wandb_project"], config=config, name=config.get("run_name"))
+        project_name = config.get("wandb_project")
+        experiment_name = config.get("wandb_experiment") or config.get("run_name")
+        if project_name is None:
+            raise KeyError("Missing 'wandb_project' in configuration.")
+        wandb.init(project=project_name, config=config, name=experiment_name)
     except Exception as exc:  # pragma: no cover - wandb optional
         print(f"Failed to initialize wandb ({exc}); continuing without logging.")
         return None
@@ -209,6 +213,7 @@ def evaluate(model, loader, criterion, device):
 if __name__ == "__main__":
     default_config = {
         "wandb_project": "grasp-force",
+        "wandb_experiment": "baseline",
         "run_name": "baseline",
         "batch_size": 16,
         "epochs": 50,
