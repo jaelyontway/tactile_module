@@ -1,7 +1,7 @@
 wandb_project: grasp-force
 wandb_experiment: baseline
 run_name: baseline
-use_wandb: false
+use_wandb: true
 wandb_mode: offline
 
 batch_size: 16
@@ -22,9 +22,9 @@ dummy_seed: 0
 robomimic:
   train_path: ~/multi-modal/data/robomimic/success_2025_11_04.hdf5
   val_path: ~/multi-modal/data/robomimic/success_2025_11_04.hdf5
-  image_key: obs/wrist_image_left_rgb
-  tactile_key: obs/tactile_values
-  force_key: obs/future_force_prediction
+  image_key:
+  tactile_key:
+  force_key:
   image_size: 224
   tactile_length: 500
   tactile_window: 500

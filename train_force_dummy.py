@@ -73,11 +73,11 @@ class RobomimicForceDataset(Dataset):
     def __init__(
         self,
         hdf5_path: str | Path,
-        image_key: str,
-        tactile_key: str,
-        force_key: str,
-        tactile_length: int,
-        tactile_channels: int,
+        image_key: Optional[str],
+        tactile_key: Optional[str],
+        force_key: Optional[str],
+        tactile_length: Optional[int],
+        tactile_channels: Optional[int],
         tactile_pad_value: float = 0.0,
         tactile_window: Optional[int] = None,
         image_size: Optional[int] = None,
@@ -87,15 +87,9 @@ class RobomimicForceDataset(Dataset):
         if not self.hdf5_path.exists():
             raise FileNotFoundError(f"Robomimic dataset '{self.hdf5_path}' does not exist.")
 
-        self.image_key = image_key
-        self.tactile_key = tactile_key
-        self.force_key = force_key
-        self.image_size = image_size
-        self.normalize_images = normalize_images
-        self.tactile_length = int(tactile_length)
-        self.tactile_channels = int(tactile_channels)
-        self.tactile_pad_value = float(tactile_pad_value)
-        self.tactile_window = int(tactile_window) if tactile_window is not None else self.tactile_length
+        requested_image_key = image_key
+        requested_tactile_key = tactile_key
+        requested_force_key = force_key
 
         try:
             import h5py  # type: ignore
@@ -104,10 +98,65 @@ class RobomimicForceDataset(Dataset):
                 "h5py is required to read Robomimic datasets. Install it via `pip install h5py`."
             ) from exc
 
-        self._indices: list[Tuple[str, int]] = []
+        autodetect_info = None
         with h5py.File(self.hdf5_path, "r") as handle:
             if "data" not in handle:
                 raise KeyError(f"File '{self.hdf5_path}' does not contain a 'data' group.")
+            data_group = handle["data"]
+            try:
+                first_episode = next(iter(data_group.keys()))
+            except StopIteration as exc:
+                raise ValueError(f"No trajectories found in Robomimic dataset '{self.hdf5_path}'.") from exc
+            trajectory = data_group[first_episode]
+            obs_group, obs_prefix = self._find_observation_group(trajectory)
+            autodetect_info = self._autodetect_modalities(obs_group, obs_prefix)
+
+        if image_key is None:
+            image_key = autodetect_info.get("image_key")
+        if tactile_key is None:
+            tactile_key = autodetect_info.get("tactile_key")
+        if force_key is None:
+            force_key = autodetect_info.get("force_key")
+
+        if not image_key or not tactile_key or not force_key:
+            raise ValueError(
+                "Unable to determine image, tactile, and force keys automatically. "
+                "Provide them explicitly in the configuration."
+            )
+
+        self.image_key = image_key
+        self.tactile_key = tactile_key
+        self.force_key = force_key
+        self.image_size = image_size
+        self.normalize_images = normalize_images
+
+        if tactile_channels is None:
+            tactile_channels = autodetect_info.get("tactile_channels")
+        if tactile_channels is None:
+            raise ValueError("Unable to infer tactile channel count; please set 'tactile_channels' explicitly.")
+        self.tactile_channels = int(tactile_channels)
+
+        if tactile_length is None:
+            tactile_length = autodetect_info.get("tactile_length")
+        if tactile_length is None:
+            raise ValueError("Unable to infer tactile sequence length; please set 'tactile_length' explicitly.")
+        self.tactile_length = int(tactile_length)
+
+        self.tactile_pad_value = float(tactile_pad_value)
+        self.tactile_window = int(tactile_window) if tactile_window is not None else self.tactile_length
+
+        autodetected_fields = []
+        if requested_image_key is None:
+            autodetected_fields.append(f"image='{self.image_key}'")
+        if requested_tactile_key is None:
+            autodetected_fields.append(f"tactile='{self.tactile_key}'")
+        if requested_force_key is None:
+            autodetected_fields.append(f"force='{self.force_key}'")
+        if autodetected_fields:
+            print("[RobomimicForceDataset] Auto-selected " + ", ".join(autodetected_fields))
+
+        self._indices: list[Tuple[str, int]] = []
+        with h5py.File(self.hdf5_path, "r") as handle:
             data_group = handle["data"]
             for episode_key in data_group.keys():
                 trajectory = data_group[episode_key]
@@ -127,6 +176,128 @@ class RobomimicForceDataset(Dataset):
                 continue
             node = node[key]
         return node
+
+    @staticmethod
+    def _find_observation_group(trajectory):
+        for candidate in ("observations", "obs"):
+            if candidate in trajectory:
+                return trajectory[candidate], candidate
+        raise KeyError(
+            "Could not locate observation group. Expected 'observations' or 'obs' in trajectory."
+        )
+
+    @staticmethod
+    def _collect_datasets(group, prefix: str):
+        import h5py  # type: ignore
+
+        datasets: list[tuple[str, Tuple[int, ...], Any]] = []
+        for key, value in group.items():
+            path = f"{prefix}{key}"
+            if isinstance(value, h5py.Dataset):
+                datasets.append((path, tuple(int(dim) for dim in value.shape), value.dtype))
+            elif hasattr(value, "items"):
+                datasets.extend(RobomimicForceDataset._collect_datasets(value, path + "/"))
+        return datasets
+
+    @staticmethod
+    def _autodetect_modalities(group, prefix: str):
+        datasets = RobomimicForceDataset._collect_datasets(group, prefix=f"{prefix}/")
+
+        def score_image(entry):
+            path, shape, dtype = entry
+            if len(shape) < 3:
+                return -1
+            lower = path.lower()
+            score = 0
+            if len(shape) >= 4:
+                score += 2
+            if shape[-1] in (3, 4):
+                score += 3
+            if "image" in lower or "rgb" in lower or "camera" in lower or "cam" in lower:
+                score += 4
+            if "wrist" in lower or "hand" in lower or "gripper" in lower:
+                score += 3
+            if "exterior" in lower:
+                score -= 1
+            if dtype.kind in {"u", "f"}:
+                score += 1
+            return score
+
+        def score_tactile(entry):
+            path, shape, _ = entry
+            if len(shape) < 2:
+                return -1
+            lower = path.lower()
+            score = 0
+            if "tactile" in lower or "touch" in lower:
+                score += 4
+            if len(shape) >= 3:
+                score += 2
+            small_dims = [dim for dim in shape if dim <= 32]
+            if small_dims:
+                score += 2
+            return score
+
+        def score_force(entry):
+            path, shape, dtype = entry
+            if len(shape) < 1:
+                return -1
+            lower = path.lower()
+            score = 0
+            if "force" in lower:
+                score += 5
+            if dtype.kind == "f":
+                score += 2
+            if len(shape) <= 2:
+                score += 1
+            if max(shape[1:], default=1) <= 4:
+                score += 1
+            return score
+
+        image_entry = max(datasets, key=score_image, default=None)
+        tactile_entry = max(datasets, key=score_tactile, default=None)
+        force_entry = max(datasets, key=score_force, default=None)
+
+        result = {
+            "image_key": image_entry[0] if image_entry else None,
+            "tactile_key": tactile_entry[0] if tactile_entry else None,
+            "force_key": force_entry[0] if force_entry else None,
+            "tactile_length": None,
+            "tactile_channels": None,
+            "autodetected_image": image_entry is not None,
+            "autodetected_tactile": tactile_entry is not None,
+            "autodetected_force": force_entry is not None,
+        }
+
+        if tactile_entry:
+            _, shape, _ = tactile_entry
+            length, channels = RobomimicForceDataset._infer_tactile_dims(shape)
+            result["tactile_length"] = length
+            result["tactile_channels"] = channels
+
+        return result
+
+    @staticmethod
+    def _infer_tactile_dims(shape: Tuple[int, ...]) -> Tuple[int, int]:
+        if len(shape) < 2:
+            return int(shape[0]), 1
+        dims = list(shape[1:])  # drop time dimension
+        if not dims:
+            return int(shape[0]), 1
+        if len(dims) == 1:
+            return int(dims[0]), 1
+        candidate_channels = None
+        for dim in reversed(dims):
+            if dim <= 32:
+                candidate_channels = dim
+                break
+        if candidate_channels is None:
+            candidate_channels = min(dims)
+        if dims[0] == candidate_channels and len(dims) > 1:
+            length = dims[1]
+        else:
+            length = dims[0] if dims[0] != candidate_channels else (dims[1] if len(dims) > 1 else dims[0])
+        return int(length), int(candidate_channels)
 
     def __len__(self) -> int:
         return len(self._indices)
@@ -338,9 +509,12 @@ def train(config):
             if not hdf5_path:
                 raise ValueError(f"Missing robomimic.{path_key} path in configuration.")
 
-            image_key = dataset_cfg.get("image_key", "observations/images/agentview_image")
-            tactile_key = dataset_cfg.get("tactile_key", "observations/tactile")
-            force_key = dataset_cfg.get("force_key", "observations/force")
+            image_key_value = dataset_cfg.get("image_key")
+            tactile_key_value = dataset_cfg.get("tactile_key")
+            force_key_value = dataset_cfg.get("force_key")
+            image_key = image_key_value if image_key_value not in (None, "", "auto") else None
+            tactile_key = tactile_key_value if tactile_key_value not in (None, "", "auto") else None
+            force_key = force_key_value if force_key_value not in (None, "", "auto") else None
 
             image_size_value = dataset_cfg.get("image_size", config.get("dummy_image_size"))
             try:
@@ -348,25 +522,40 @@ def train(config):
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid robomimic.image_size value: {image_size_value!r}") from exc
 
+            tactile_length_value = dataset_cfg.get("tactile_length", config.get("dummy_tactile_length"))
             try:
-                tactile_length = int(dataset_cfg.get("tactile_length", config.get("dummy_tactile_length", 500)))
+                tactile_length = (
+                    int(tactile_length_value)
+                    if tactile_length_value not in (None, "", "auto")
+                    else None
+                )
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid robomimic.tactile_length value: {dataset_cfg.get('tactile_length')!r}") from exc
+                raise ValueError(f"Invalid robomimic.tactile_length value: {tactile_length_value!r}") from exc
 
-            tactile_window = dataset_cfg.get("tactile_window")
-            if tactile_window is not None:
+            tactile_window_value = dataset_cfg.get("tactile_window")
+            if tactile_window_value in (None, "", "auto"):
+                tactile_window = None
+            else:
                 try:
-                    tactile_window = int(tactile_window)
+                    tactile_window = int(tactile_window_value)
                 except (TypeError, ValueError) as exc:
-                    raise ValueError(f"Invalid robomimic.tactile_window value: {tactile_window!r}") from exc
+                    raise ValueError(f"Invalid robomimic.tactile_window value: {tactile_window_value!r}") from exc
+
+            tactile_pad_value_value = dataset_cfg.get("tactile_pad_value", 0.0)
             try:
-                tactile_pad_value = float(dataset_cfg.get("tactile_pad_value", 0.0))
+                tactile_pad_value = float(tactile_pad_value_value)
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid robomimic.tactile_pad_value value: {dataset_cfg.get('tactile_pad_value')!r}") from exc
+                raise ValueError(f"Invalid robomimic.tactile_pad_value value: {tactile_pad_value_value!r}") from exc
+
+            tactile_channels_value = dataset_cfg.get("tactile_channels", 6)
             try:
-                tactile_channels = int(dataset_cfg.get("tactile_channels", 6))
+                tactile_channels = (
+                    int(tactile_channels_value)
+                    if tactile_channels_value not in (None, "", "auto")
+                    else None
+                )
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid robomimic.tactile_channels value: {dataset_cfg.get('tactile_channels')!r}") from exc
+                raise ValueError(f"Invalid robomimic.tactile_channels value: {tactile_channels_value!r}") from exc
             normalize_images = bool(dataset_cfg.get("normalize_images", True))
 
             return RobomimicForceDataset(
