@@ -11,9 +11,23 @@ weight_decay: 1e-2
 num_workers: 0
 checkpoint_path: checkpoints/multimodal_force.pt
 
+dataset_type: dummy
 use_dummy_data: true
 dummy_train_size: 512
 dummy_val_size: 128
 dummy_image_size: 224
 dummy_tactile_length: 500
 dummy_seed: 0
+
+robomimic:
+  train_path:
+  val_path:
+  image_key: observations/images/agentview_image
+  tactile_key: observations/tactile
+  force_key: observations/force
+  image_size: 224
+  tactile_length: 500
+  tactile_window: 500
+  tactile_pad_value: 0.0
+  tactile_channels: 6
+  normalize_images: true

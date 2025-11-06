@@ -1,9 +1,11 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from .model import MultimodalForceTransformer, MultimodalTransformerConfig
 
@@ -58,6 +60,157 @@ class DummyForceDataset(Dataset):
         return image.float(), tactile.float(), force.float()
 
 
+class RobomimicForceDataset(Dataset):
+    """
+    Dataset wrapper for Robomimic-format HDF5 files.
+
+    The loader expects a file with a ``data`` group containing trajectory entries. Each
+    trajectory is indexed as ``data/<episode_id>`` and exposes the same observation keys
+    available during Robomimic training. The configuration selects which keys correspond
+    to RGB frames, tactile sensor readings, and the force supervision signal.
+    """
+
+    def __init__(
+        self,
+        hdf5_path: str | Path,
+        image_key: str,
+        tactile_key: str,
+        force_key: str,
+        tactile_length: int,
+        tactile_channels: int,
+        tactile_pad_value: float = 0.0,
+        tactile_window: Optional[int] = None,
+        image_size: Optional[int] = None,
+        normalize_images: bool = True,
+    ):
+        self.hdf5_path = Path(hdf5_path).expanduser()
+        if not self.hdf5_path.exists():
+            raise FileNotFoundError(f"Robomimic dataset '{self.hdf5_path}' does not exist.")
+
+        self.image_key = image_key
+        self.tactile_key = tactile_key
+        self.force_key = force_key
+        self.image_size = image_size
+        self.normalize_images = normalize_images
+        self.tactile_length = int(tactile_length)
+        self.tactile_channels = int(tactile_channels)
+        self.tactile_pad_value = float(tactile_pad_value)
+        self.tactile_window = int(tactile_window) if tactile_window is not None else self.tactile_length
+
+        try:
+            import h5py  # type: ignore
+        except ImportError as exc:  # pragma: no cover - dependency provided via requirements
+            raise RuntimeError(
+                "h5py is required to read Robomimic datasets. Install it via `pip install h5py`."
+            ) from exc
+
+        self._indices: list[Tuple[str, int]] = []
+        with h5py.File(self.hdf5_path, "r") as handle:
+            if "data" not in handle:
+                raise KeyError(f"File '{self.hdf5_path}' does not contain a 'data' group.")
+            data_group = handle["data"]
+            for episode_key in data_group.keys():
+                trajectory = data_group[episode_key]
+                force_dataset = self._resolve_dataset(trajectory, self.force_key)
+                horizon = int(force_dataset.shape[0])
+                for timestep in range(horizon):
+                    self._indices.append((episode_key, timestep))
+
+        if not self._indices:
+            raise ValueError(f"No samples found in Robomimic dataset '{self.hdf5_path}'.")
+
+    @staticmethod
+    def _resolve_dataset(group, key_path: str):
+        node = group
+        for key in key_path.split("/"):
+            if not key:
+                continue
+            node = node[key]
+        return node
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def _load_image(self, trajectory, timestep: int) -> torch.Tensor:
+        image_np = np.array(self._resolve_dataset(trajectory, self.image_key)[timestep])
+        if image_np.ndim != 3:
+            raise ValueError(f"Expected image tensor with 3 dimensions, got shape {image_np.shape}.")
+
+        if image_np.shape[0] == 3:
+            image = torch.from_numpy(image_np).float()
+        else:
+            image = torch.from_numpy(np.transpose(image_np, (2, 0, 1))).float()
+
+        if self.normalize_images:
+            if image.max() > 1.5:  # assume uint8 range
+                image = image / 255.0
+
+        if self.image_size is not None and (
+            image.shape[1] != self.image_size or image.shape[2] != self.image_size
+        ):
+            image = F.interpolate(
+                image.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        return image.contiguous()
+
+    def _load_tactile(self, trajectory, timestep: int) -> torch.Tensor:
+        tactile_np = np.array(self._resolve_dataset(trajectory, self.tactile_key))
+        if tactile_np.ndim == 1:
+            tactile_np = tactile_np[:, None]
+
+        if tactile_np.ndim != 2:
+            raise ValueError(
+                f"Expected tactile array with shape (time, channels); received shape {tactile_np.shape}."
+            )
+
+        window = min(self.tactile_window, tactile_np.shape[0])
+        start = max(0, timestep + 1 - window)
+        tactile_window = tactile_np[start : timestep + 1]
+
+        tactile_tensor = torch.from_numpy(tactile_window).float()
+        if tactile_tensor.size(-1) != self.tactile_channels:
+            if tactile_tensor.size(0) == self.tactile_channels:
+                tactile_tensor = tactile_tensor.transpose(0, 1)
+            else:
+                raise ValueError(
+                    f"Tactile channels mismatch: expected {self.tactile_channels}, got {tactile_tensor.size(-1)}."
+                )
+
+        if tactile_tensor.size(0) < self.tactile_length:
+            pad = torch.full(
+                (self.tactile_length - tactile_tensor.size(0), self.tactile_channels),
+                self.tactile_pad_value,
+                dtype=torch.float32,
+            )
+            tactile_tensor = torch.cat([pad, tactile_tensor], dim=0)
+        elif tactile_tensor.size(0) > self.tactile_length:
+            tactile_tensor = tactile_tensor[-self.tactile_length :]
+
+        return tactile_tensor.contiguous()
+
+    def _load_force(self, trajectory, timestep: int) -> torch.Tensor:
+        force_value = np.array(self._resolve_dataset(trajectory, self.force_key)[timestep])
+        return torch.tensor(float(np.asarray(force_value).squeeze()), dtype=torch.float32)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        try:
+            import h5py  # type: ignore
+        except ImportError as exc:  # pragma: no cover - should already be installed
+            raise RuntimeError(
+                "h5py is required to read Robomimic datasets. Install it via `pip install h5py`."
+            ) from exc
+
+        episode_key, timestep = self._indices[index]
+        with h5py.File(self.hdf5_path, "r") as handle:
+            trajectory = handle["data"][episode_key]
+            image = self._load_image(trajectory, timestep)
+            tactile = self._load_tactile(trajectory, timestep)
+            force = self._load_force(trajectory, timestep)
+        return image, tactile, force
 def _ensure_tmpdir() -> Optional[Path]:
     candidates = []
     env_tmp = os.environ.get("TMPDIR")
@@ -166,8 +319,65 @@ def train(config):
     if wandb_module is not None:
         wandb_module.watch(model, log_freq=100, log="all")
 
+    dataset_type = config.get("dataset_type", "dummy").lower()
+
     def build_dataset(split: str):
-        use_dummy = config.get("use_dummy_data", False) or ForceDataset is None
+        if dataset_type == "robomimic":
+            dataset_cfg = config.get("robomimic", {})
+            path_key = "train_path" if split == "train" else "val_path"
+            hdf5_path = dataset_cfg.get(path_key)
+            if not hdf5_path:
+                raise ValueError(f"Missing robomimic.{path_key} path in configuration.")
+
+            image_key = dataset_cfg.get("image_key", "observations/images/agentview_image")
+            tactile_key = dataset_cfg.get("tactile_key", "observations/tactile")
+            force_key = dataset_cfg.get("force_key", "observations/force")
+
+            image_size_value = dataset_cfg.get("image_size", config.get("dummy_image_size"))
+            try:
+                image_size = int(image_size_value) if image_size_value not in (None, "", 0) else None
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid robomimic.image_size value: {image_size_value!r}") from exc
+
+            try:
+                tactile_length = int(dataset_cfg.get("tactile_length", config.get("dummy_tactile_length", 500)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid robomimic.tactile_length value: {dataset_cfg.get('tactile_length')!r}") from exc
+
+            tactile_window = dataset_cfg.get("tactile_window")
+            if tactile_window is not None:
+                try:
+                    tactile_window = int(tactile_window)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid robomimic.tactile_window value: {tactile_window!r}") from exc
+            try:
+                tactile_pad_value = float(dataset_cfg.get("tactile_pad_value", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid robomimic.tactile_pad_value value: {dataset_cfg.get('tactile_pad_value')!r}") from exc
+            try:
+                tactile_channels = int(dataset_cfg.get("tactile_channels", 6))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid robomimic.tactile_channels value: {dataset_cfg.get('tactile_channels')!r}") from exc
+            normalize_images = bool(dataset_cfg.get("normalize_images", True))
+
+            return RobomimicForceDataset(
+                hdf5_path=hdf5_path,
+                image_key=image_key,
+                tactile_key=tactile_key,
+                force_key=force_key,
+                tactile_length=tactile_length,
+                tactile_channels=tactile_channels,
+                tactile_pad_value=tactile_pad_value,
+                tactile_window=tactile_window,
+                image_size=image_size,
+                normalize_images=normalize_images,
+            )
+
+        use_dummy = (
+            config.get("use_dummy_data", False)
+            or ForceDataset is None
+            or dataset_type == "dummy"
+        )
         if not use_dummy:
             if ForceDataset is None:
                 raise RuntimeError("ForceDataset is unavailable. Enable 'use_dummy_data' or provide an implementation.")
@@ -231,9 +441,12 @@ def train(config):
         print(f"Epoch {epoch:03d}: train {train_loss:.4f} / val {val_loss:.4f}")
 
     if can_save_checkpoint:
-        torch.save(model.state_dict(), checkpoint_path)
-        if wandb_module is not None:
-            wandb_module.save(str(checkpoint_path))
+        try:
+            torch.save(model.state_dict(), checkpoint_path)
+            if wandb_module is not None:
+                wandb_module.save(str(checkpoint_path))
+        except (OSError, RuntimeError) as exc:
+            print(f"Failed to save checkpoint to '{checkpoint_path}': {exc}")
     if wandb_module is not None:
         wandb_module.finish()
 

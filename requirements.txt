@@ -6,3 +6,4 @@ numpy>=1.23
 # Experiment tracking and logging
 wandb>=0.15
 pyyaml>=6.0
+h5py>=3.9
