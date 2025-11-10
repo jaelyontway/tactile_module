@@ -2,6 +2,8 @@
 # Adjust the PyTorch install if you require a specific CUDA build.
 torch>=2.1.0
 numpy>=1.23
+transformers>=4.41
+safetensors>=0.4
 
 # Experiment tracking and logging
 wandb>=0.15

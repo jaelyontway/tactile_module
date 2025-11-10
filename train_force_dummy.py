@@ -2,6 +2,7 @@ import argparse
 import logging
 import math
 import os
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -416,11 +417,39 @@ def load_config(path: Optional[str] = None) -> dict:
     return data
 
 
+def _build_model_config(config_dict: dict) -> MultimodalTransformerConfig:
+    """
+    Extract ``MultimodalTransformerConfig`` overrides from the training config.
+
+    Users can specify a ``model`` section in the YAML file with any subset of the
+    dataclass fields (e.g. ``image_encoder_type``, ``dinov3_model_name``).
+    """
+
+    model_section = config_dict.get("model")
+    if model_section is None:
+        return MultimodalTransformerConfig()
+    if not isinstance(model_section, dict):
+        raise TypeError(
+            f"'model' configuration must be a mapping of field names to values, got {type(model_section)!r}."
+        )
+
+    model_kwargs = {}
+    for field in fields(MultimodalTransformerConfig):
+        if field.name not in model_section:
+            continue
+        value = model_section[field.name]
+        if value is None:
+            continue
+        model_kwargs[field.name] = value
+    return MultimodalTransformerConfig(**model_kwargs)
+
+
 def train(config):
     wandb_module = _initialize_wandb(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = MultimodalForceTransformer(MultimodalTransformerConfig()).to(device)
+    model_config = _build_model_config(config)
+    model = MultimodalForceTransformer(model_config).to(device)
     if wandb_module is not None:
         wandb_module.watch(model, log_freq=100, log="all")
 
@@ -547,6 +576,17 @@ def train(config):
             ),
         )
         return dataset
+
+    log_once(
+        "model-config",
+        "[train] Model config: "
+        + ", ".join(f"{key}={value}" for key, value in asdict(model_config).items()),
+    )
+    log_once(
+        "image-encoder",
+        f"[train] Using image encoder {model.image_encoder.__class__.__name__} "
+        f"({model_config.image_encoder_type}, source={getattr(model_config, 'dinov3_model_name', 'n/a')})",
+    )
 
     train_loader = DataLoader(
         build_dataset("train"),

@@ -13,11 +13,13 @@ it can be trained end-to-end or fine-tuned together with downstream code.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -27,8 +29,14 @@ class MultimodalTransformerConfig:
 
     Attributes:
         image_in_channels: Number of input channels for the image stream (default: RGB → 3).
-        image_token_grid: Spatial resolution (height == width) after the image encoder.
-            The number of image tokens equals ``image_token_grid ** 2``.
+        image_token_grid: Spatial resolution (height == width) after the image encoder when using
+            the lightweight CNN. The number of image tokens equals ``image_token_grid ** 2``.
+        image_encoder_type: Which vision backbone to instantiate. ``"dino_v3"`` uses a pretrained
+            ViT while ``"conv"`` selects the legacy CNN stem.
+        dinov3_model_name: Hugging Face checkpoint identifier for the pretrained DINOv3 backbone.
+        dinov3_freeze_backbone: When ``True`` the ViT weights stay frozen during training.
+        dinov3_drop_cls_token: Drop the CLS token before projecting into the fusion space.
+        dinov3_normalize_inputs: Apply ImageNet mean/std normalisation before DINO forwarding.
         tactile_channels: Number of sensor channels in the tactile stream.
         tactile_tokens: Number of tokens that represent the temporal tactile signal.
         d_model: Transformer embedding dimension. Both encoders project into this space.
@@ -40,6 +48,11 @@ class MultimodalTransformerConfig:
 
     image_in_channels: int = 3
     image_token_grid: int = 14
+    image_encoder_type: str = "dino_v3"  # Options: "dino_v3", "conv"
+    dinov3_model_name: str = "facebook/dinov3-vit7b16-pretrain-lvd1689m"
+    dinov3_freeze_backbone: bool = True
+    dinov3_drop_cls_token: bool = True
+    dinov3_normalize_inputs: bool = True
     tactile_channels: int = 6
     tactile_tokens: int = 20
     d_model: int = 256
@@ -52,51 +65,157 @@ class MultimodalTransformerConfig:
         return self.image_token_grid * self.image_token_grid
 
 
-class ImageEncoder2D(nn.Module):
-    """
-    Lightweight convolutional encoder that maps images to a fixed grid of tokens.
+# class ImageEncoder2D(nn.Module):
+#     """
+#     Lightweight convolutional encoder that maps images to a fixed grid of tokens.
+#
+#     The encoder uses a small convolutional stem with progressive downsampling followed
+#     by an adaptive pooling stage. This ensures a consistent number of output tokens
+#     regardless of the input image size, provided the height and width are at least 8×
+#     ``image_token_grid`` (e.g. 112px when the grid is 14).
+#     """
+#
+#     def __init__(self, in_channels: int, embed_dim: int, grid_size: int, dropout: float = 0.1):
+#         super().__init__()
+#         hidden_dim = embed_dim // 2
+#         self.num_tokens = grid_size * grid_size
+#
+#         self.stem = nn.Sequential(
+#             nn.Conv2d(in_channels, hidden_dim, kernel_size=7, stride=2, padding=3, bias=False),
+#             nn.BatchNorm2d(hidden_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+#             nn.BatchNorm2d(hidden_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
+#             nn.BatchNorm2d(hidden_dim),
+#             nn.ReLU(inplace=True),
+#         )
+#
+#         self.pool = nn.AdaptiveAvgPool2d((grid_size, grid_size))
+#         self.proj = nn.Conv2d(hidden_dim, embed_dim, kernel_size=1, bias=False)
+#         self.dropout = nn.Dropout(dropout)
+#         self.norm = nn.LayerNorm(embed_dim)
+#
+#     def forward(self, images: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             images: Float tensor with shape ``(batch, channels, height, width)``.
+#
+#         Returns:
+#             Tensor with shape ``(batch, num_tokens, embed_dim)`` where
+#             ``num_tokens == grid_size ** 2``.
+#         """
+#         features = self.stem(images)
+#         pooled = self.pool(features)
+#         embedded = self.proj(pooled)  # (B, embed_dim, grid, grid)
+#         tokens = embedded.flatten(2).transpose(1, 2)  # (B, num_tokens, embed_dim)
+#
+#         tokens = self.dropout(tokens)
+#         tokens = self.norm(tokens)
+#         return tokens
 
-    The encoder uses a small convolutional stem with progressive downsampling followed
-    by an adaptive pooling stage. This ensures a consistent number of output tokens
-    regardless of the input image size, provided the height and width are at least 8×
-    ``image_token_grid`` (e.g. 112px when the grid is 14).
+
+class DinoV3ImageEncoder(nn.Module):
+    """
+    Wrapper around a pretrained DINOv3 vision transformer loaded via Hugging Face ``transformers``.
+
+    The module keeps the backbone in eval mode by default and optionally freezes its weights. Inputs
+    are resized to the backbone's expected image size (usually 224) and normalised with ImageNet
+    statistics before being forwarded through the transformer. Patch tokens (CLS removed by default)
+    are then projected into ``embed_dim`` so they can be consumed by the downstream multimodal model.
     """
 
-    def __init__(self, in_channels: int, embed_dim: int, grid_size: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        embed_dim: int,
+        model_name: str,
+        dropout: float = 0.1,
+        freeze_backbone: bool = True,
+        drop_cls_token: bool = True,
+        normalize_inputs: bool = True,
+    ):
         super().__init__()
-        hidden_dim = embed_dim // 2
+        try:
+            from transformers import AutoModel  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional heavy dependency
+            raise ImportError(
+                "The 'transformers' package is required for the DINOv3 image encoder. "
+                "Install it via `pip install transformers safetensors`."
+            ) from exc
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_dim, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
+        self.backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        hidden_size = getattr(self.backbone.config, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(f"DINO backbone '{model_name}' does not expose 'hidden_size'.")
+
+        self.backbone.eval()
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        self.drop_cls_token = drop_cls_token
+        self.normalize_inputs = normalize_inputs
+        self.expected_image_size = getattr(self.backbone.config, "image_size", None)
+        patch_size = getattr(self.backbone.config, "patch_size", None)
+        num_patches = getattr(self.backbone.config, "num_patches", None)
+        num_register_tokens = int(getattr(self.backbone.config, "num_register_tokens", 0))
+
+        if num_patches is None and self.expected_image_size and patch_size:
+            if isinstance(patch_size, (tuple, list)):
+                patch_h, patch_w = patch_size[0], patch_size[-1]
+            else:
+                patch_h = patch_w = patch_size
+            grid_h = self.expected_image_size // patch_h
+            grid_w = self.expected_image_size // patch_w
+            num_patches = grid_h * grid_w
+
+        if num_patches is None:
+            raise ValueError(
+                f"Unable to infer number of image tokens from DINO config: {self.backbone.config}"
+            )
+
+        # Total tokens = patches + register tokens + CLS (always produced, optionally dropped).
+        total_tokens = int(num_patches) + num_register_tokens + 1
+        self.num_tokens = total_tokens - 1 if drop_cls_token else total_tokens
+
+        self.project = (
+            nn.Linear(hidden_size, embed_dim, bias=False)
+            if hidden_size != embed_dim
+            else nn.Identity()
         )
-
-        self.pool = nn.AdaptiveAvgPool2d((grid_size, grid_size))
-        self.proj = nn.Conv2d(hidden_dim, embed_dim, kernel_size=1, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(embed_dim)
+        pixel_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        pixel_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("pixel_mean", pixel_mean, persistent=False)
+        self.register_buffer("pixel_std", pixel_std, persistent=False)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images: Float tensor with shape ``(batch, channels, height, width)``.
+        if images.dim() != 4:
+            raise ValueError(f"Expected 4D image tensor, got shape {tuple(images.shape)}")
 
-        Returns:
-            Tensor with shape ``(batch, num_tokens, embed_dim)`` where
-            ``num_tokens == grid_size ** 2``.
-        """
-        features = self.stem(images)
-        pooled = self.pool(features)
-        embedded = self.proj(pooled)  # (B, embed_dim, grid, grid)
-        tokens = embedded.flatten(2).transpose(1, 2)  # (B, num_tokens, embed_dim)
+        if self.normalize_inputs:
+            pixel_mean = self.pixel_mean.to(dtype=images.dtype, device=images.device)
+            pixel_std = self.pixel_std.to(dtype=images.dtype, device=images.device)
+            images = (images - pixel_mean) / pixel_std
 
+        if self.expected_image_size is not None and (
+            images.shape[-2] != self.expected_image_size or images.shape[-1] != self.expected_image_size
+        ):
+            images = F.interpolate(
+                images,
+                size=(self.expected_image_size, self.expected_image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        outputs = self.backbone(pixel_values=images)
+        tokens = outputs.last_hidden_state
+        if self.drop_cls_token:
+            tokens = tokens[:, 1:, :]
+
+        tokens = self.project(tokens)
         tokens = self.dropout(tokens)
         tokens = self.norm(tokens)
         return tokens
@@ -169,7 +288,7 @@ class MultimodalForceTransformer(nn.Module):
         >>> config = MultimodalTransformerConfig()
         >>> model = MultimodalForceTransformer(config)
         >>> images = torch.randn(4, 3, 224, 224)
-        >>> tactile = torch.randn(4, 500, 6)
+        >>> tactile = torch.randn(4, 500, 6) --> (4,50,6) change to 0.5 s 
         >>> force = model(images, tactile)
         >>> force.shape
         torch.Size([4, 1])
@@ -179,12 +298,30 @@ class MultimodalForceTransformer(nn.Module):
         super().__init__()
         self.config = config or MultimodalTransformerConfig()
 
-        self.image_encoder = ImageEncoder2D(
-            in_channels=self.config.image_in_channels,
-            embed_dim=self.config.d_model,
-            grid_size=self.config.image_token_grid,
-            dropout=self.config.dropout,
+        if self.config.image_encoder_type.lower() == "dino_v3":
+            self.image_encoder = DinoV3ImageEncoder(
+                embed_dim=self.config.d_model,
+                model_name=self.config.dinov3_model_name,
+                dropout=self.config.dropout,
+                freeze_backbone=self.config.dinov3_freeze_backbone,
+                drop_cls_token=self.config.dinov3_drop_cls_token,
+                normalize_inputs=self.config.dinov3_normalize_inputs,
+            )
+        # else:
+        #     self.image_encoder = ImageEncoder2D(
+        #         in_channels=self.config.image_in_channels,
+        #         embed_dim=self.config.d_model,
+        #         grid_size=self.config.image_token_grid,
+        #         dropout=self.config.dropout,
+        #     )
+
+        logging.getLogger(__name__).info(
+            "Instantiated image encoder %s (type=%s, source=%s)",
+            self.image_encoder.__class__.__name__,
+            self.config.image_encoder_type,
+            getattr(self.config, "dinov3_model_name", "n/a"),
         )
+
         self.tactile_encoder = TactileEncoder1D(
             in_channels=self.config.tactile_channels,
             embed_dim=self.config.d_model,
@@ -193,9 +330,8 @@ class MultimodalForceTransformer(nn.Module):
         )
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.config.d_model))
-        self.image_positional = nn.Parameter(
-            torch.randn(1, self.config.num_image_tokens(), self.config.d_model) * 0.02
-        )
+        image_tokens = getattr(self.image_encoder, "num_tokens", self.config.num_image_tokens())
+        self.image_positional = nn.Parameter(torch.randn(1, image_tokens, self.config.d_model) * 0.02)
         self.tactile_positional = nn.Parameter(
             torch.randn(1, self.config.tactile_tokens, self.config.d_model) * 0.02
         )
@@ -280,7 +416,8 @@ class MultimodalForceTransformer(nn.Module):
 
 __all__ = [
     "MultimodalTransformerConfig",
-    "ImageEncoder2D",
+    # "ImageEncoder2D",  # Commented out - only using DINOv3 encoder
+    "DinoV3ImageEncoder",
     "TactileEncoder1D",
     "MultimodalForceTransformer",
 ]

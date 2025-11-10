@@ -3,14 +3,14 @@ Expose multimodal transformer components for tactile + visual force prediction.
 """
 
 from .model import (
-    ImageEncoder2D,
+    DinoV3ImageEncoder,
     MultimodalForceTransformer,
     MultimodalTransformerConfig,
     TactileEncoder1D,
 )
 
 __all__ = [
-    "ImageEncoder2D",
+    "DinoV3ImageEncoder",
     "TactileEncoder1D",
     "MultimodalTransformerConfig",
     "MultimodalForceTransformer",

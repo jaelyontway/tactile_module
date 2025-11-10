@@ -3,7 +3,7 @@
 Multimodal PyTorch components for predicting grasping force from synchronized vision and tactile sensor traces. The package ships a reusable transformer architecture and a self-contained training script that can run either on synthetic dummy data or on a custom dataset that matches the expected interface.
 
 ## Features
-- Image encoder that converts RGB frames into a grid of tokens compatible with transformer models.
+- Pretrained DINOv3 image encoder (via Hugging Face Transformers) that emits ViT patch tokens ready for fusion.
 - Tactile encoder that summarizes 500×6 sensor sequences into the same embedding space.
 - Transformer fusion block with a regression head that predicts a single force value.
 - Training harness (`train_force_dummy.py`) that demonstrates data loading, logging with Weights & Biases (optional), and checkpointing.
@@ -41,6 +41,16 @@ class ForceDataset(Dataset):
 ```
 
 Run the training script with `use_dummy_data=False` in the config to switch to the real dataset.
+
+### Using The DINOv3 Image Encoder
+The default configuration now loads a pretrained DINOv3 transformer through the Hugging Face `transformers` package. Make sure `pip install -r requirements.txt` has been run so the dependency (and its `safetensors` helper) are available. Key knobs live in `MultimodalTransformerConfig` (`tactile_module/model.py`):
+
+- `image_encoder_type`: set to `dino_v3` (default) to activate the pretrained backbone or `conv` to fall back to the lightweight CNN.
+- `dinov3_model_name`: Hugging Face identifier for the checkpoint, e.g. `facebook/dinov3-base` or any custom repo with compatible weights.
+- `dinov3_freeze_backbone`: freeze ViT weights during training (default `true`).
+- `dinov3_drop_cls_token`: remove the CLS token so only patch tokens feed the multimodal transformer.
+
+Inputs are automatically resized to the backbone’s advertised resolution (usually 224) and normalised with ImageNet statistics before being forwarded through DINOv3.
 
 ## Configuration
 - Edit `configs/default.yaml` to change hyperparameters, logging options, or dataset settings. For example, updating `wandb_experiment` or `batch_size` in the YAML file automatically applies to the next training run.
