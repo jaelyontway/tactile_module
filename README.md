@@ -76,6 +76,7 @@ model = MultimodalForceTransformer(config)
 
 images = torch.randn(4, 3, 224, 224)      # batch, channel, height, width
 tactile = torch.randn(4, 500, 6)          # batch, sequence length, channels
+# should be (4, 50, 6) later ?? fix 
 force = model(images, tactile)            # -> (4, 1)
 ```
 

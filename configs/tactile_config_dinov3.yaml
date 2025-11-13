@@ -2,7 +2,7 @@ wandb_project: tactile_module
 wandb_experiment: smoke_test_3
 run_name: smoke_test_3
 use_wandb: true
-wandb_mode: online          # set to 'online' when network access is available
+wandb_mode: offline         # offline logging to avoid external network calls
 
 batch_size: 16
 epochs: 50
@@ -10,7 +10,7 @@ lr: 1e-4
 weight_decay: 1e-2
 grad_clip_norm: 1.0
 num_workers: 0
-checkpoint_path: checkpoints/multimodal_force.pt
+checkpoint_path: /home/pi0/multi-modal/data-builder-multi-modal/checkpoints/multimodal_force.pt
 
 dataset_type: robomimic
 use_dummy_data: false

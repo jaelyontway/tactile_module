@@ -1,14 +1,32 @@
 """
-Multimodal transformer for grasping force prediction.
+Multimodal transformer for predicting gripper motion deltas.
 
 This module implements the core model requested by the user:
-  * A 2D image encoder that converts RGB frames into a compact sequence of tokens.
-  * A 1D tactile encoder that ingests temporal sensor traces shaped (500, 6).
+  * A 2D image encoder (DINOv3 or CLIP) that converts RGB frames into a compact token stream.
+  * A Perceiver-style resampler that compresses ViT patch tokens into 10 latent tokens.
+  * A 1D tactile encoder that ingests temporal sensor traces shaped (≈50, 6) and emits 3 tokens.
   * A transformer encoder that fuses both modalities through self-attention.
-  * A small regression head that maps the fused representation to a single force value.
+  * A regression head that maps the fused representation to the delta gripper position target.
 
-The implementation intentionally avoids external dependencies beyond PyTorch so
-it can be trained end-to-end or fine-tuned together with downstream code.
+The implementation intentionally avoids external dependencies beyond PyTorch (plus ``transformers``
+for the vision backbones) so it can be trained end-to-end together with downstream code.
+
+
+  | Component               | Line | Shape                  | Description           |
+  |-------------------------|------|------------------------|-----------------------|
+  | PerceiverResampler      | 617  | (B,196,256)→(B,10,256) | Compress 196→10       |
+  | DINOv3 register tokens  | 615  | (B, 4, 256)            | keep same             |
+  | Image tokens concat     | 619  | (B, 14, 256)           | 4 register+ 10 patch  |
+  | Fusion CLS token        | 631  | (B, 1, 256)            | learnable CLS         |
+  | Tactile tokens          | 628  | (B, 3, 256)            | Conv1D 3 token        |
+  | Final transformer input | 649  | (B, 18, 256)           | 1+14+3=18 tokens      |
+
+  Final transformer input using dinov3:
+  [CLS] [Reg1, Reg2, Reg3, Reg4] [P1'...P10'] [Tac1, Tac2, Tac3]
+
+  Final transformer input using clip:
+  [CLS] [P1'...P10'] [Tac1, Tac2, Tac3]
+
 """
 
 from __future__ import annotations
@@ -20,6 +38,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import logging
 
 
 @dataclass
@@ -37,8 +57,16 @@ class MultimodalTransformerConfig:
         dinov3_freeze_backbone: When ``True`` the ViT weights stay frozen during training.
         dinov3_drop_cls_token: Drop the CLS token before projecting into the fusion space.
         dinov3_normalize_inputs: Apply ImageNet mean/std normalisation before DINO forwarding.
+
         tactile_channels: Number of sensor channels in the tactile stream.
         tactile_tokens: Number of tokens that represent the temporal tactile signal.
+
+        perceiver_num_latents: Number of learnable latents used by the perceiver resampler.
+        perceiver_num_layers: Depth of the perceiver resampler cross-attention stack.
+        perceiver_num_heads: Attention heads inside the perceiver resampler.
+        use_perceiver_resampler: Enable the perceiver resampler for patch tokens.
+        clip_model_name: Hugging Face checkpoint identifier when using the CLIP encoder.
+        clip_freeze_backbone: When ``True`` the CLIP vision encoder stays frozen.
         d_model: Transformer embedding dimension. Both encoders project into this space.
         nhead: Number of attention heads in the transformer encoder.
         num_layers: Number of transformer encoder layers.
@@ -48,13 +76,22 @@ class MultimodalTransformerConfig:
 
     image_in_channels: int = 3
     image_token_grid: int = 14
-    image_encoder_type: str = "dino_v3"  # Options: "dino_v3", "conv"
-    dinov3_model_name: str = "facebook/dinov3-vit7b16-pretrain-lvd1689m"
-    dinov3_freeze_backbone: bool = True
-    dinov3_drop_cls_token: bool = True
+    image_encoder_type: str = "dino_v3"                                  # Options: "dino_v3", "clip"
+    dinov3_model_name: str = "facebook/dinov3-vit7b16-pretrain-lvd1689m" # smallest model, not perform the best accordingly to their github
+    dinov3_freeze_backbone: bool = True                                 # freeze DINOv3 weights during training, no learn until in the latent token 
+    dinov3_drop_cls_token: bool = True                                  # drop CLS token before fusion
     dinov3_normalize_inputs: bool = True
+
     tactile_channels: int = 6
-    tactile_tokens: int = 20
+    tactile_tokens: int = 3
+
+    perceiver_num_latents: int = 10                                     # resample tokens for image from 196 to 10 
+    perceiver_num_layers: int = 2
+    perceiver_num_heads: int = 8
+    use_perceiver_resampler: bool = True
+
+    clip_model_name: str = "openai/clip-vit-base-patch16"
+    clip_freeze_backbone: bool = True
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 4
@@ -65,6 +102,7 @@ class MultimodalTransformerConfig:
         return self.image_token_grid * self.image_token_grid
 
 
+# CNN version
 # class ImageEncoder2D(nn.Module):
 #     """
 #     Lightweight convolutional encoder that maps images to a fixed grid of tokens.
@@ -145,10 +183,12 @@ class DinoV3ImageEncoder(nn.Module):
             ) from exc
 
         self.backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        # hidden_size = # token of features in each token vector inside the transformer
         hidden_size = getattr(self.backbone.config, "hidden_size", None)
         if hidden_size is None:
             raise ValueError(f"DINO backbone '{model_name}' does not expose 'hidden_size'.")
 
+        # Use dinov3 as a frozen encoder, no train it 
         self.backbone.eval()
         if freeze_backbone:
             for param in self.backbone.parameters():
@@ -177,6 +217,8 @@ class DinoV3ImageEncoder(nn.Module):
 
         # Total tokens = patches + register tokens + CLS (always produced, optionally dropped).
         total_tokens = int(num_patches) + num_register_tokens + 1
+        self.num_patch_tokens = int(num_patches)
+        self.num_register_tokens = int(num_register_tokens)
         self.num_tokens = total_tokens - 1 if drop_cls_token else total_tokens
 
         self.project = (
@@ -186,13 +228,23 @@ class DinoV3ImageEncoder(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(embed_dim)
+        
+        """
+        fixed constatn from ImagNet
+        param used in dinov3 github: 
+        IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+        CROP_DEFAULT_SIZE = 224
+        view(batch size, 3 RGB, H, W)
+        """
+        # calibration 
         pixel_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         pixel_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         self.register_buffer("pixel_mean", pixel_mean, persistent=False)
         self.register_buffer("pixel_std", pixel_std, persistent=False)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        if images.dim() != 4:
+        if images.dim() != 4: #(B, C, H, W)
             raise ValueError(f"Expected 4D image tensor, got shape {tuple(images.shape)}")
 
         if self.normalize_inputs:
@@ -200,6 +252,7 @@ class DinoV3ImageEncoder(nn.Module):
             pixel_std = self.pixel_std.to(dtype=images.dtype, device=images.device)
             images = (images - pixel_mean) / pixel_std
 
+        # if img size is not 224x224, bilinear resize it 
         if self.expected_image_size is not None and (
             images.shape[-2] != self.expected_image_size or images.shape[-1] != self.expected_image_size
         ):
@@ -210,15 +263,202 @@ class DinoV3ImageEncoder(nn.Module):
                 align_corners=False,
             )
 
+        # feed to Dinov3 transformer 
         outputs = self.backbone(pixel_values=images)
-        tokens = outputs.last_hidden_state
-        if self.drop_cls_token:
-            tokens = tokens[:, 1:, :]
+        hidden = outputs.last_hidden_state
 
-        tokens = self.project(tokens)
-        tokens = self.dropout(tokens)
-        tokens = self.norm(tokens)
-        return tokens
+        # split output tokens (order: CLS → Register → Patch)
+        # source: https://huggingface.co/docs/transformers/main/en/model_doc/dinov3?utm_source=chatgpt.com
+        cls_token = hidden[:, :1, :]
+        register_tokens = hidden[:, 1 : 1 + self.num_register_tokens, :]
+        patch_tokens = hidden[:, 1 + self.num_register_tokens :, :]
+        if not self.drop_cls_token:
+            register_tokens = torch.cat([cls_token, register_tokens], dim=1)
+
+        patch_tokens = self.project(patch_tokens)
+        patch_tokens = self.dropout(patch_tokens)
+        patch_tokens = self.norm(patch_tokens)
+
+        if register_tokens.numel() > 0:
+            register_tokens = self.project(register_tokens)
+            register_tokens = self.dropout(register_tokens)
+            register_tokens = self.norm(register_tokens)
+        else:
+            register_tokens = patch_tokens.new_zeros(
+                patch_tokens.size(0), 0, patch_tokens.size(-1), requires_grad=False
+            )
+
+        return patch_tokens, register_tokens
+
+
+class ClipImageEncoder(nn.Module):
+    """
+    Image encoder that wraps a pretrained CLIP vision transformer.
+
+    The implementation mirrors :class:`DinoV3ImageEncoder` but leverages CLIP checkpoints
+    from Hugging Face. Only the vision tower is used; projection heads are discarded.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        model_name: str,
+        dropout: float = 0.1,
+        freeze_backbone: bool = True,
+        drop_cls_token: bool = True,
+        normalize_inputs: bool = True,
+    ):
+        super().__init__()
+        try:
+            from transformers import CLIPVisionModel  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "The 'transformers' package is required for the CLIP image encoder. "
+                "Install it via `pip install transformers safetensors`."
+            ) from exc
+
+        self.backbone = CLIPVisionModel.from_pretrained(model_name)
+        vision_config = self.backbone.config
+        hidden_size = getattr(vision_config, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(f"CLIP backbone '{model_name}' does not expose 'hidden_size'.")
+
+        self.backbone.eval()
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        self.drop_cls_token = drop_cls_token
+        self.normalize_inputs = normalize_inputs
+        self.expected_image_size = int(getattr(vision_config, "image_size", 224))
+        patch_size = getattr(vision_config, "patch_size", 16)
+        grid = self.expected_image_size // patch_size
+        self.num_patch_tokens = grid * grid
+        # clip does not use register tokens
+        self.num_register_tokens = 0
+
+        self.project = (
+            nn.Linear(hidden_size, embed_dim, bias=False)
+            if hidden_size != embed_dim
+            else nn.Identity()
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # mean and std source
+        # https://github.com/openai/CLIP/blob/dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1/clip/clip.py#L85
+
+        pixel_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        pixel_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        self.register_buffer("pixel_mean", pixel_mean, persistent=False)
+        self.register_buffer("pixel_std", pixel_std, persistent=False)
+
+    def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if images.dim() != 4:
+            raise ValueError(f"Expected 4D image tensor, got shape {tuple(images.shape)}")
+
+        if self.normalize_inputs:
+            pixel_mean = self.pixel_mean.to(dtype=images.dtype, device=images.device)
+            pixel_std = self.pixel_std.to(dtype=images.dtype, device=images.device)
+            images = (images - pixel_mean) / pixel_std
+
+        if images.shape[-2] != self.expected_image_size or images.shape[-1] != self.expected_image_size:
+            images = F.interpolate(
+                images,
+                size=(self.expected_image_size, self.expected_image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        outputs = self.backbone(pixel_values=images)
+        hidden = outputs.last_hidden_state
+        cls_token = hidden[:, :1, :]
+        patch_tokens = hidden[:, 1 : 1 + self.num_patch_tokens, :]
+
+        if not self.drop_cls_token:
+            register_tokens = cls_token
+        else:
+            register_tokens = torch.zeros(
+                (images.size(0), 0, patch_tokens.size(-1)),
+                dtype=patch_tokens.dtype,
+                device=patch_tokens.device,
+            )
+
+        patch_tokens = self.project(patch_tokens)
+        patch_tokens = self.dropout(patch_tokens)
+        patch_tokens = self.norm(patch_tokens)
+
+        if register_tokens.numel() > 0:
+            register_tokens = self.project(register_tokens)
+            register_tokens = self.dropout(register_tokens)
+            register_tokens = self.norm(register_tokens)
+
+        return patch_tokens, register_tokens
+        # Clip does not have register_tokens
+
+
+class PerceiverResamplerLayer(nn.Module):
+    """Single cross-attention + MLP block used inside the perceiver resampler."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.latent_norm = nn.LayerNorm(dim)
+        self.input_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+        )
+        self.mlp_dropout = nn.Dropout(dropout)
+
+    def forward(self, latents: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+        # stabilize latent-toekn distribution before attention, signal calibration 
+        query = self.latent_norm(latents)
+        # latent queries and input values on the same scale 
+        key_value = self.input_norm(inputs)
+        # smart fusion, cross-attention
+        # no care weights, only care fusion result 
+        attn_out, _ = self.attn(query, key_value, key_value, need_weights=False)
+        latents = latents + self.attn_dropout(attn_out)
+        # MLP refinement
+        latents = latents + self.mlp_dropout(self.mlp(latents))
+        return latents
+
+
+class PerceiverResampler(nn.Module):
+    """
+    Learnable resampler inspired by Perceiver/Flamingo that compresses long token sequences.
+    Learnable latent tokens performing corss-attention on input tokens to produce a fixed-size output.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_latents: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        # lernable query vectors will extract info from input tokens via cross-attention
+        self.latents = nn.Parameter(torch.randn(1, num_latents, dim) * 0.02)
+        self.layers = nn.ModuleList(
+            PerceiverResamplerLayer(dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout)
+            for _ in range(num_layers)
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        latents = self.latents.expand(tokens.size(0), -1, -1)
+        for layer in self.layers:
+            latents = layer(latents, tokens)
+        return latents
 
 
 class TactileEncoder1D(nn.Module):
@@ -288,9 +528,9 @@ class MultimodalForceTransformer(nn.Module):
         >>> config = MultimodalTransformerConfig()
         >>> model = MultimodalForceTransformer(config)
         >>> images = torch.randn(4, 3, 224, 224)
-        >>> tactile = torch.randn(4, 500, 6) --> (4,50,6) change to 0.5 s 
-        >>> force = model(images, tactile)
-        >>> force.shape
+        >>> tactile = torch.randn(4, 50, 6)
+        >>> delta_gripper = model(images, tactile)
+        >>> delta_gripper.shape
         torch.Size([4, 1])
     """
 
@@ -298,7 +538,8 @@ class MultimodalForceTransformer(nn.Module):
         super().__init__()
         self.config = config or MultimodalTransformerConfig()
 
-        if self.config.image_encoder_type.lower() == "dino_v3":
+        encoder_type = self.config.image_encoder_type.lower()
+        if encoder_type == "dino_v3":
             self.image_encoder = DinoV3ImageEncoder(
                 embed_dim=self.config.d_model,
                 model_name=self.config.dinov3_model_name,
@@ -307,21 +548,45 @@ class MultimodalForceTransformer(nn.Module):
                 drop_cls_token=self.config.dinov3_drop_cls_token,
                 normalize_inputs=self.config.dinov3_normalize_inputs,
             )
-        # else:
-        #     self.image_encoder = ImageEncoder2D(
-        #         in_channels=self.config.image_in_channels,
-        #         embed_dim=self.config.d_model,
-        #         grid_size=self.config.image_token_grid,
-        #         dropout=self.config.dropout,
-        #     )
+        elif encoder_type == "clip":
+            self.image_encoder = ClipImageEncoder(
+                embed_dim=self.config.d_model,
+                model_name=self.config.clip_model_name,
+                dropout=self.config.dropout,
+                freeze_backbone=self.config.clip_freeze_backbone,
+                drop_cls_token=self.config.dinov3_drop_cls_token,
+                normalize_inputs=self.config.dinov3_normalize_inputs,
+            )
+        else:
+            raise ValueError(f"Unsupported image_encoder_type '{self.config.image_encoder_type}'.")
 
         logging.getLogger(__name__).info(
             "Instantiated image encoder %s (type=%s, source=%s)",
             self.image_encoder.__class__.__name__,
             self.config.image_encoder_type,
-            getattr(self.config, "dinov3_model_name", "n/a"),
+            getattr(
+                self.config,
+                "dinov3_model_name" if encoder_type == "dino_v3" else "clip_model_name",
+                "n/a",
+            ),
         )
 
+        patch_tokens_available = getattr(self.image_encoder, "num_patch_tokens", self.config.num_image_tokens())
+        self.num_register_tokens = getattr(self.image_encoder, "num_register_tokens", 0)
+        if self.config.use_perceiver_resampler:
+            self.image_resampler = PerceiverResampler(
+                dim=self.config.d_model,
+                num_latents=self.config.perceiver_num_latents,
+                num_layers=self.config.perceiver_num_layers,
+                num_heads=self.config.perceiver_num_heads,
+                dropout=self.config.dropout,
+            )
+            self.image_patch_token_count = self.config.perceiver_num_latents
+        else:
+            self.image_resampler = None
+            self.image_patch_token_count = patch_tokens_available
+
+        total_image_tokens = self.image_patch_token_count + self.num_register_tokens
         self.tactile_encoder = TactileEncoder1D(
             in_channels=self.config.tactile_channels,
             embed_dim=self.config.d_model,
@@ -330,8 +595,7 @@ class MultimodalForceTransformer(nn.Module):
         )
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.config.d_model))
-        image_tokens = getattr(self.image_encoder, "num_tokens", self.config.num_image_tokens())
-        self.image_positional = nn.Parameter(torch.randn(1, image_tokens, self.config.d_model) * 0.02)
+        self.image_positional = nn.Parameter(torch.randn(1, total_image_tokens, self.config.d_model) * 0.02)
         self.tactile_positional = nn.Parameter(
             torch.randn(1, self.config.tactile_tokens, self.config.d_model) * 0.02
         )
@@ -378,7 +642,19 @@ class MultimodalForceTransformer(nn.Module):
             image_tokens: Image tokens with positional encoding applied.
             tactile_tokens: Tactile tokens with positional encoding applied.
         """
-        image_tokens = self.image_encoder(images) + self.image_positional
+        patch_tokens, register_tokens = self.image_encoder(images)
+        if self.image_resampler is not None:
+            patch_tokens = self.image_resampler(patch_tokens)
+        if register_tokens is not None and register_tokens.numel() > 0:
+            image_tokens = torch.cat([patch_tokens, register_tokens], dim=1)
+        else:
+            image_tokens = patch_tokens
+
+        if image_tokens.size(1) != self.image_positional.size(1):
+            raise ValueError(
+                f"Image token count mismatch (expected {self.image_positional.size(1)}, got {image_tokens.size(1)})."
+            )
+        image_tokens = image_tokens + self.image_positional
         tactile_tokens = self.tactile_encoder(tactile) + self.tactile_positional
 
         batch_size = images.size(0)
@@ -396,7 +672,7 @@ class MultimodalForceTransformer(nn.Module):
             return_tokens: When ``True``, the method also returns the fused token sequence.
 
         Returns:
-            force: Regression output ``(batch, 1)``.
+            delta_gripper: Regression output ``(batch, 1)`` representing the gripper delta.
             tokens (optional): Token sequence after the transformer ``(batch, total_tokens, d_model)``.
         """
         cls_tokens, image_tokens, tactile_tokens = self.forward_features(images, tactile)
@@ -407,17 +683,18 @@ class MultimodalForceTransformer(nn.Module):
         fused = self.transformer_norm(fused)
 
         cls_output = fused[:, 0, :]
-        force = self.regression_head(cls_output)
+        delta_gripper = self.regression_head(cls_output)
 
         if return_tokens:
-            return force, fused
-        return force
+            return delta_gripper, fused
+        return delta_gripper
 
 
 __all__ = [
     "MultimodalTransformerConfig",
-    # "ImageEncoder2D",  # Commented out - only using DINOv3 encoder
     "DinoV3ImageEncoder",
+    "ClipImageEncoder",
+    "PerceiverResampler",
     "TactileEncoder1D",
     "MultimodalForceTransformer",
 ]

@@ -10,7 +10,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from .model import MultimodalForceTransformer, MultimodalTransformerConfig
+
+try:
+    from .model import MultimodalForceTransformer, MultimodalTransformerConfig
+    from .data_utils import compute_gripper_deltas
+except ImportError:
+    from model import MultimodalForceTransformer, MultimodalTransformerConfig
+    from data_utils import compute_gripper_deltas
 
 try:
     from my_dataset import ForceDataset  # type: ignore
@@ -33,7 +39,7 @@ class DummyForceDataset(Dataset):
     Each item returns:
         image: (3, image_size, image_size) float tensor
         tactile: (tactile_len, 6) float tensor
-        force: scalar tensor correlated with the inputs
+        delta: scalar tensor representing the gripper delta
     """
 
     def __init__(
@@ -65,14 +71,14 @@ class DummyForceDataset(Dataset):
         tactile = torch.randn(self.tactile_len, 6, generator=gen)
 
         # Simple synthetic target correlated with both modalities
-        force = 5.0 * image.mean() + 2.0 * tactile.mean()
-        force = force.clamp(min=0.0)
+        delta = 5.0 * image.mean() + 2.0 * tactile.mean()
+        delta = delta.clamp(min=0.0)
 
-        return image.float(), tactile.float(), force.float()
+        return image.float(), tactile.float(), delta.float()
 
 
 class RobomimicForceDataset(Dataset):
-    """Dataset wrapper for Robomimic-format HDF5 files."""
+    """Dataset wrapper for Robomimic-format HDF5 files that targets gripper deltas."""
 
     LOGGED_DATASETS: set[str] = set()
 
@@ -81,13 +87,14 @@ class RobomimicForceDataset(Dataset):
         hdf5_path: str | Path,
         image_key: str,
         tactile_key: str,
-        force_key: str,
+        gripper_key: str,
         tactile_length: int,
         tactile_channels: int,
         tactile_pad_value: float = 0.0,
         tactile_window: Optional[int] = None,
         image_size: Optional[int] = None,
         normalize_images: bool = True,
+        idle_epsilon: Optional[float] = None,
     ):
         self.hdf5_path = Path(hdf5_path).expanduser()
         if not self.hdf5_path.exists():
@@ -102,42 +109,64 @@ class RobomimicForceDataset(Dataset):
 
         self.image_key = image_key
         self.tactile_key = tactile_key
-        self.force_key = force_key
+        self.gripper_key = gripper_key
         self.image_size = image_size
         self.normalize_images = normalize_images
         self.tactile_channels = int(tactile_channels)
         self.tactile_length = int(tactile_length)
         self.tactile_pad_value = float(tactile_pad_value)
         self.tactile_window = int(tactile_window) if tactile_window is not None else self.tactile_length
+        self.idle_epsilon = float(idle_epsilon) if idle_epsilon not in (None, "", False) else None
 
         self._indices: list[tuple[str, int]] = []
+        self.filtered_idle = 0
+        self.total_candidates = 0
         with h5py.File(self.hdf5_path, 'r') as handle:
             data_group = handle['data']
             for episode_key in data_group.keys():
                 trajectory = data_group[episode_key]
-                force_dataset = self._resolve_dataset(trajectory, self.force_key)
-                horizon = int(force_dataset.shape[0])
+                gripper_dataset = np.array(self._resolve_dataset(trajectory, self.gripper_key))
+                if gripper_dataset.shape[0] < 2:
+                    continue
+                horizon = gripper_dataset.shape[0] - 1
+                active_mask = None
+                if self.idle_epsilon is not None:
+                    _, active_mask = compute_gripper_deltas(gripper_dataset, epsilon=self.idle_epsilon)
+                    if active_mask.size == 0:
+                        continue
                 for timestep in range(horizon):
+                    self.total_candidates += 1
+                    if active_mask is not None and not active_mask[timestep]:
+                        self.filtered_idle += 1
+                        continue
                     self._indices.append((episode_key, timestep))
 
         if not self._indices:
             raise ValueError(f"No samples found in Robomimic dataset '{self.hdf5_path}'.")
-        key_signature = f"{self.hdf5_path}:{self.image_key}:{self.tactile_key}:{self.force_key}"
+        key_signature = f"{self.hdf5_path}:{self.image_key}:{self.tactile_key}:{self.gripper_key}"
         if key_signature not in self.LOGGED_DATASETS:
             episode_key, timestep = self._indices[0]
             with h5py.File(self.hdf5_path, 'r') as handle:
                 trajectory = handle['data'][episode_key]
                 image_shape = np.array(self._resolve_dataset(trajectory, self.image_key)[timestep]).shape
                 tactile_shape = np.array(self._resolve_dataset(trajectory, self.tactile_key)).shape
-                force_shape = np.array(self._resolve_dataset(trajectory, self.force_key)[timestep]).shape
-            logger.info(
-                "[RobomimicForceDataset] image_key='%s' shape=%s, tactile_key='%s' shape=%s, force_key='%s' shape=%s",
+                gripper_shape = np.array(self._resolve_dataset(trajectory, self.gripper_key)).shape
+            extra = ""
+            args = [
                 self.image_key,
                 image_shape,
                 self.tactile_key,
                 tactile_shape,
-                self.force_key,
-                force_shape,
+                self.gripper_key,
+                gripper_shape,
+                len(self._indices),
+            ]
+            if self.idle_epsilon is not None:
+                extra = ", filtered_idle=%d"
+                args.append(self.filtered_idle)
+            logger.info(
+                "[RobomimicForceDataset] image_key='%s' shape=%s, tactile_key='%s' shape=%s, gripper_key='%s' shape=%s, kept=%d" + extra,
+                *args,
             )
             self.LOGGED_DATASETS.add(key_signature)
 
@@ -212,10 +241,13 @@ class RobomimicForceDataset(Dataset):
 
         return tactile_tensor.contiguous()
 
-    def _load_force(self, trajectory, timestep: int) -> torch.Tensor:
-        force_value = np.array(self._resolve_dataset(trajectory, self.force_key)[timestep])
-        force_scalar = float(force_value.reshape(-1)[-1])
-        return torch.tensor(force_scalar, dtype=torch.float32)
+    def _load_gripper_delta(self, trajectory, timestep: int) -> torch.Tensor:
+        gripper_dataset = np.array(self._resolve_dataset(trajectory, self.gripper_key))
+        if timestep + 1 >= gripper_dataset.shape[0]:
+            delta = 0.0
+        else:
+            delta = float(gripper_dataset[timestep + 1].reshape(-1)[-1] - gripper_dataset[timestep].reshape(-1)[-1])
+        return torch.tensor(delta, dtype=torch.float32)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         try:
@@ -230,8 +262,8 @@ class RobomimicForceDataset(Dataset):
             trajectory = handle['data'][episode_key]
             image = self._load_image(trajectory, timestep)
             tactile = self._load_tactile(trajectory, timestep)
-            force = self._load_force(trajectory, timestep)
-        return image, tactile, force
+            delta = self._load_gripper_delta(trajectory, timestep)
+        return image, tactile, delta
 
     def __len__(self) -> int:
         return len(self._indices)
@@ -477,6 +509,29 @@ def train(config):
             print(message)
             logged_messages.add(identifier)
 
+    def describe_dataset(split: str, dataset: Dataset) -> None:
+        try:
+            length = len(dataset)
+        except Exception:  # pragma: no cover - logging helper should never fail
+            length = "unknown"
+
+        if isinstance(dataset, RobomimicForceDataset):
+            logger.info(
+                "[train] %s split source: Robomimic hdf5=%s (samples=%s)",
+                split,
+                dataset.hdf5_path,
+                length,
+            )
+        elif isinstance(dataset, DummyForceDataset):
+            logger.info("[train] %s split source: DummyForceDataset (samples=%s)", split, length)
+        else:
+            logger.info(
+                "[train] %s split source: %s (samples=%s)",
+                split,
+                dataset.__class__.__name__,
+                length,
+            )
+
     def build_dataset(split: str):
         if dataset_type == "robomimic":
             dataset_cfg = config.get("robomimic", {})
@@ -487,10 +542,10 @@ def train(config):
 
             image_key = dataset_cfg.get("image_key")
             tactile_key = dataset_cfg.get("tactile_key")
-            force_key = dataset_cfg.get("force_key")
-            if not image_key or not tactile_key or not force_key:
+            gripper_key = dataset_cfg.get("gripper_key")
+            if not image_key or not tactile_key or not gripper_key:
                 raise ValueError(
-                    "Robomimic configuration must provide 'image_key', 'tactile_key', and 'force_key'."
+                    "Robomimic configuration must provide 'image_key', 'tactile_key', and 'gripper_key'."
                 )
 
             image_size_value = dataset_cfg.get("image_size", config.get("dummy_image_size"))
@@ -527,23 +582,30 @@ def train(config):
                 raise ValueError(f"Invalid robomimic.tactile_channels value: {tactile_channels_value!r}") from exc
             normalize_images = bool(dataset_cfg.get("normalize_images", True))
 
+            idle_epsilon_value = dataset_cfg.get("idle_epsilon", 0.0)
+            try:
+                idle_epsilon = float(idle_epsilon_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid robomimic.idle_epsilon value: {idle_epsilon_value!r}") from exc
+
             dataset = RobomimicForceDataset(
                 hdf5_path=hdf5_path,
                 image_key=image_key,
                 tactile_key=tactile_key,
-                force_key=force_key,
+                gripper_key=gripper_key,
                 tactile_length=tactile_length,
                 tactile_channels=tactile_channels,
                 tactile_pad_value=tactile_pad_value,
                 tactile_window=tactile_window,
                 image_size=image_size,
                 normalize_images=normalize_images,
+                idle_epsilon=idle_epsilon,
             )
             log_once(
                 f"robomimic-{split}",
                 (
                     f"[train] Using Robomimic dataset ({split}) from {dataset.hdf5_path} "
-                    f"(image='{dataset.image_key}', tactile='{dataset.tactile_key}', force='{dataset.force_key}')"
+                    f"(image='{dataset.image_key}', tactile='{dataset.tactile_key}', gripper='{dataset.gripper_key}')"
                 ),
             )
             return dataset
@@ -588,15 +650,20 @@ def train(config):
         f"({model_config.image_encoder_type}, source={getattr(model_config, 'dinov3_model_name', 'n/a')})",
     )
 
+    train_dataset = build_dataset("train")
+    val_dataset = build_dataset("val")
+    describe_dataset("train", train_dataset)
+    describe_dataset("val", val_dataset)
+
     train_loader = DataLoader(
-        build_dataset("train"),
+        train_dataset,
         batch_size=config["batch_size"],
         shuffle=True,
         num_workers=config["num_workers"],
         pin_memory=True,
     )
     val_loader = DataLoader(
-        build_dataset("val"),
+        val_dataset,
         batch_size=config["batch_size"],
         shuffle=False,
     )
@@ -707,7 +774,7 @@ def evaluate(model, loader, criterion, device):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the multimodal force prediction model.")
+    parser = argparse.ArgumentParser(description="Train the multimodal gripper-delta prediction model.")
     parser.add_argument(
         "--config",
         type=str,
