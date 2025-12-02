@@ -22,7 +22,7 @@ for the vision backbones) so it can be trained end-to-end together with downstre
   | Final transformer input | 649  | (B, 18, 256)           | 1+14+3=18 tokens      |
 
   Final transformer input using dinov3:
-  [CLS] [Reg1, Reg2, Reg3, Reg4] [P1'...P10'] [Tac1, Tac2, Tac3]
+  [CLS] [Reg1, Reg2, Reg3, Reg4] [Left P1'...P10'] [Right P1'...P10'][Tac1, Tac2, Tac3]
 
   Final transformer input using clip:
   [CLS] [P1'...P10'] [Tac1, Tac2, Tac3]

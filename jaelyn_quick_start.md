@@ -34,6 +34,19 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
      python train_tactile_gripper.py --config configs/tactile_config_dinov3.yaml
 ```
 
+## Run this command to start robot inference 
+```
+# Terminal 1 
+cd /home/pi0/multi-modal/openpi-multi-modal/scripts
+uv run serve_policy.py --env BASE
+
+# Terminal 2 
+cd /home/pi0/multi-modal/droid-multi-modal/scripts
+conda activate droid-tact
+python tactile_module_demo_v2.py
+```
+<!-- 
+Gripper positions are in [0.0, 1.0], with 0.0 corresponding to fully open and 1.0 corresponding to fully closed -->
 
 <!-- <!-- No need to run separately 
 ### Filter out idle state 
