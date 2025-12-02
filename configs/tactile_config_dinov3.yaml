@@ -1,8 +1,8 @@
 wandb_project: tactile_module
-wandb_experiment: smoke_test_3
-run_name: smoke_test_3
+wandb_experiment: smoke_test_4
+run_name: smoke_test_4
 use_wandb: true
-wandb_mode: offline         # offline logging to avoid external network calls
+wandb_mode: online          # online logging to wandb
 
 batch_size: 16
 epochs: 50
@@ -34,14 +34,18 @@ model:
   use_perceiver_resampler: true
   d_model: 256
   nhead: 8
-  num_layers: 4
+  num_layers: 8
   dim_feedforward: 512
   dropout: 0.1
+  use_masking: true
+  image_mask_ratio: 0.5
+  tactile_mask_ratio: 0.3
 
 robomimic:
-  train_path: ~/multi-modal/data/robomimic/success_filtered_2025_11_11_delta_gripper_delta.hdf5
-  val_path: ~/multi-modal/data/robomimic/success_filtered_2025_11_11_delta_gripper_delta.hdf5
-  image_key: obs/wrist_image_left_rgb      # vision stream to feed the image encoder
+  train_path: /home/pi0/multi-modal/data/robomimic/success_delta_2025_11_21_delta.hdf5
+  val_path: /home/pi0/multi-modal/data/robomimic/success_delta_2025_11_21_delta.hdf5
+  image_key: obs/wrist_image_left_rgb      # vision stream to feed the image encoder (left wrist camera)
+  image_key_right: obs/wrist_image_right_rgb  # right wrist camera vision stream
   tactile_key: obs/tactile_values          # tactile stream (time, channels) for the tactile encoder
   gripper_key: obs/delta_gripper_position  # pre-computed deltas (already filtered with epsilon=0.005)
   image_size: 224                          # resize frames to a consistent resolution

@@ -8,10 +8,13 @@ from .model import (
     MultimodalTransformerConfig,
     TactileEncoder1D,
 )
+from .robot_inference_adapter import AdapterConfig, TactileGripperAdapter
 
 __all__ = [
     "DinoV3ImageEncoder",
     "TactileEncoder1D",
     "MultimodalTransformerConfig",
     "MultimodalForceTransformer",
+    "AdapterConfig",
+    "TactileGripperAdapter",
 ]

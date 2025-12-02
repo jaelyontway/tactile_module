@@ -1,12 +1,14 @@
 # Tactile Module
 
-Multimodal PyTorch components for predicting grasping force from synchronized vision and tactile sensor traces. The package ships a reusable transformer architecture and a self-contained training script that can run either on synthetic dummy data or on a custom dataset that matches the expected interface.
+Multimodal PyTorch components for predicting gripper action chunks from synchronized dual-camera vision and tactile sensor traces. The package ships a reusable transformer architecture and a self-contained training script that can run either on synthetic dummy data or on a custom dataset that matches the expected interface.
 
 ## Features
-- Pretrained DINOv3 image encoder (via Hugging Face Transformers) that emits ViT patch tokens ready for fusion.
-- Tactile encoder that summarizes 500×6 sensor sequences into the same embedding space.
-- Transformer fusion block with a regression head that predicts a single force value.
-- Training harness (`train_force_dummy.py`) that demonstrates data loading, logging with Weights & Biases (optional), and checkpointing.
+- **Dual-camera input**: Processes both left and right wrist camera images for richer visual context
+- **Action chunking**: Predicts multiple future gripper deltas (default: 10 steps) instead of a single value
+- Pretrained DINOv3 image encoder (via Hugging Face Transformers) that emits ViT patch tokens ready for fusion
+- Tactile encoder that summarizes temporal sensor sequences (default: 50×6) into the same embedding space
+- Transformer fusion block with a regression head that predicts action chunks
+- Training harness (`train_force_dummy.py`) that demonstrates data loading, logging with Weights & Biases (optional), and checkpointing
 
 ## Installation
 ```bash
@@ -30,13 +32,14 @@ The script will:
 4. Save checkpoints under `checkpoints/multimodal_force.pt` when the directory is writable.
 
 ### Custom Dataset Integration
-Provide a module named `my_dataset.py` with a `ForceDataset` class that matches the PyTorch `Dataset` interface and returns `(image, tactile, force)` tuples. When present, the training script will automatically prefer it over the dummy data:
+Provide a module named `my_dataset.py` with a `ForceDataset` class that matches the PyTorch `Dataset` interface and returns `(image_left, image_right, tactile, action_chunk)` tuples. When present, the training script will automatically prefer it over the dummy data:
 ```python
 from torch.utils.data import Dataset
 
 class ForceDataset(Dataset):
     def __getitem__(self, idx):
-        # return image (3, H, W), tactile (500, 6), force scalar
+        # return image_left (3, H, W), image_right (3, H, W), 
+        # tactile (50, 6), action_chunk (action_chunk_size,)
         ...
 ```
 
@@ -56,8 +59,8 @@ Inputs are automatically resized to the backbone’s advertised resolution (usua
 - Edit `configs/default.yaml` to change hyperparameters, logging options, or dataset settings. For example, updating `wandb_experiment` or `batch_size` in the YAML file automatically applies to the next training run.
 - Override the path at runtime with `python -m tactile_module.train_force_dummy --config path/to/custom.yaml`.
 - Use `scripts/train.sh` to launch training without worrying about `PYTHONPATH`; the script forwards any additional CLI arguments to the module entry point.
-- To train on a Robomimic dataset, set `dataset_type: robomimic` and point `robomimic.train_path` / `robomimic.val_path` to the respective `.hdf5` files. Explicitly specify the observation keys (`image_key`, `tactile_key`, `force_key`) so the loader knows which streams to consume.
-- The default configuration targets `~/multi-modal/data/robomimic/success_2025_11_04.hdf5` and uses the wrist camera (`obs/wrist_image_left_rgb`), tactile traces (`obs/tactile_values`), and force predictions (`obs/force_prediction`). Update these entries if you swap in a dataset with different naming.
+- To train on a Robomimic dataset, set `dataset_type: robomimic` and point `robomimic.train_path` / `robomimic.val_path` to the respective `.hdf5` files. Explicitly specify the observation keys (`image_key_left`, `image_key_right`, `tactile_key`, `gripper_key`) so the loader knows which streams to consume.
+- The default configuration targets `~/multi-modal/data/robomimic/success_delta_2025_11_18_delta.hdf5` and uses both wrist cameras (`obs/wrist_image_left_rgb`, `obs/wrist_image_right_rgb`), tactile traces (`obs/tactile_values`), and gripper deltas (`obs/delta_gripper_position`). The model predicts action chunks of size 10 (configurable via `action_chunk_size`).
 - Logged training metrics:
   - `train/grad_clip_rate`: fraction of updates that triggered gradient clipping; spikes flag potential gradient explosions.
   - `train/grad_norm_mean` / `train/grad_norm_max`: average and worst gradient norm per epoch; track stability and signal strength.
@@ -71,20 +74,71 @@ Inputs are automatically resized to the backbone’s advertised resolution (usua
 import torch
 from tactile_module.model import MultimodalForceTransformer, MultimodalTransformerConfig
 
-config = MultimodalTransformerConfig()
+config = MultimodalTransformerConfig(action_chunk_size=10)
 model = MultimodalForceTransformer(config)
 
-images = torch.randn(4, 3, 224, 224)      # batch, channel, height, width
-tactile = torch.randn(4, 500, 6)          # batch, sequence length, channels
-# should be (4, 50, 6) later ?? fix 
-force = model(images, tactile)            # -> (4, 1)
+images_left = torch.randn(4, 3, 224, 224)   # batch, channel, height, width
+images_right = torch.randn(4, 3, 224, 224)  # batch, channel, height, width
+tactile = torch.randn(4, 50, 6)              # batch, sequence length, channels
+action_chunk = model(images_left, images_right, tactile)  # -> (4, 10)
 ```
 
+The model processes both left and right wrist camera images separately, then concatenates their tokens before fusion with tactile features. The output is an action chunk predicting gripper deltas for the next `action_chunk_size` steps (default: 10).
+
+### Real Robot (pi0) Gripper Override
+Use the tactile model to replace the gripper dimension of pi0’s action chunk during rollout:
+```python
+from tactile_module.robot_inference_adapter import TactileGripperAdapter
+
+adapter = TactileGripperAdapter(
+    checkpoint_path="/home/pi0/multi-modal/tactile_module/checkpoints/delta_gripper.pt",
+    config_path="/home/pi0/multi-modal/tactile_module/configs/default.yaml",
+)
+
+# Inside the droid control loop (see droid-multi-modal/scripts/1-pi0.py)
+wrist_rgb_left = curr_obs["wrist_image_left"]       # H×W×3 RGB
+wrist_rgb_right = curr_obs["wrist_image_right"]    # H×W×3 RGB
+tactile_history = tactile_reader.read_values()      # (T, 6) from the ring buffer
+pi0_action = pred_action_chunk[actions_from_chunk_completed]
+current_gripper = float(curr_obs["gripper_position"][0])
+
+# Option 1: Use single delta from action chunk (backward compatible)
+merged_action, tactile_delta = adapter.override_gripper(
+    pi0_action,
+    wrist_rgb_left,
+    wrist_rgb_right,
+    tactile_history,
+    current_gripper,
+    pi0_gate=0.2,              # only override when pi0 is actively moving gripper
+    absolute_clip=(-1.0, 1.0), # RobotEnv with gripper_action_space="position"
+    step_index=0,              # use first step from action chunk
+)
+env.step(merged_action)
+
+# Option 2: Get full action chunk for planning
+action_chunk = adapter.predict_action_chunk(
+    wrist_rgb_left,
+    wrist_rgb_right,
+    tactile_history
+)  # -> (action_chunk_size,) array
+```
+This mirrors the training preprocessing: both wrist images are resized/normalised to 224×224 and tactile traces are padded/trimmed to the last 50×6 samples before the transformer predicts an action chunk of gripper deltas.
+
 ## Repository Structure
-- `model.py`: Multimodal transformer implementation.
-- `train_force_dummy.py`: Reference training loop with dummy data and optional Weights & Biases logging.
-- `requirements.txt`: Python dependencies.
-- `environment.yml`: Conda environment alternative.
+- `model.py`: Multimodal transformer implementation with dual-camera support and action chunking
+- `train_force_dummy.py`: Reference training loop with dummy data and optional Weights & Biases logging
+- `robot_inference_adapter.py`: Lightweight wrapper for real-robot inference with action chunk support
+- `test_model.py`: Model testing and evaluation script
+- `test_dataset.py`: Dataset loading verification script
+- `configs/default.yaml`: Default training configuration
+- `requirements.txt`: Python dependencies
+- `environment.yml`: Conda environment alternative
+
+## Key Configuration Parameters
+- `action_chunk_size`: Number of future gripper deltas to predict (default: 10)
+- `image_key_left` / `image_key_right`: HDF5 keys for left and right wrist camera images
+- `tactile_length`: Length of tactile sequence after padding/truncation (default: 50)
+- `tactile_channels`: Number of tactile sensor channels (default: 6)
 
 ## License
 Add your preferred license here before distributing the repository publicly.

@@ -1,6 +1,6 @@
 wandb_project: tactile_module
-wandb_experiment: smoke_test_3
-run_name: smoke_test_3
+wandb_experiment: smoke_test_8_layers 
+run_name: smoke_test_8_layers
 use_wandb: true
 wandb_mode: online          # set to 'online' when network access is available
 
@@ -10,7 +10,7 @@ lr: 1e-4
 weight_decay: 1e-2
 grad_clip_norm: 1.0
 num_workers: 0
-checkpoint_path: checkpoints/multimodal_force.pt
+checkpoint_path: checkpoints/delta_gripper.pt
 
 dataset_type: robomimic
 use_dummy_data: false
@@ -32,22 +32,28 @@ model:
   perceiver_num_layers: 2
   perceiver_num_heads: 8
   use_perceiver_resampler: true
+  action_chunk_size: 10                      # number of future action steps to predict
   d_model: 256
   nhead: 8
-  num_layers: 4
+  num_layers: 8
   dim_feedforward: 512
   dropout: 0.1
+  use_masking: true
+  image_mask_ratio: 0.5
+  tactile_mask_ratio: 0.3
 
 robomimic:
-  train_path: ~/multi-modal/data/robomimic/success_filtered_2025_11_11_delta_gripper_delta.hdf5
-  val_path: ~/multi-modal/data/robomimic/success_filtered_2025_11_11_delta_gripper_delta.hdf5
-  image_key: obs/wrist_image_left_rgb      # vision stream to feed the image encoder
-  tactile_key: obs/tactile_values          # tactile stream (time, channels) for the tactile encoder
-  gripper_key: obs/delta_gripper_position  # pre-computed deltas (already filtered with epsilon=0.005)
-  image_size: 224                          # resize frames to a consistent resolution
-  tactile_length: 50                       # final tactile sequence length after pad/truncate
-  tactile_window: 50                       # history window pulled from the raw dataset
-  tactile_pad_value: 0.0                   # pad value when history is shorter than tactile_length
-  tactile_channels: 6                      # expected tactile channel count for input validation
-  normalize_images: true                   # scale uint8 images to [0,1] floats
-  idle_epsilon: 0.0                        # already filtered offline, no need for runtime filtering
+  train_path: /home/pi0/multi-modal/data/robomimic/success_delta_2025_11_21_delta.hdf5
+  val_path: /home/pi0/multi-modal/data/robomimic/success_delta_2025_11_21_delta.hdf5
+  image_key: obs/wrist_image_left_rgb        # left wrist camera vision stream
+  image_key_right: obs/wrist_image_right_rgb  # right wrist camera vision stream
+  tactile_key: obs/tactile_values            # tactile stream (time, channels) for the tactile encoder
+  gripper_key: obs/delta_gripper_position    # pre-computed deltas (already filtered with epsilon=0.005)
+  action_chunk_size: 10                      # number of future steps to predict
+  image_size: 224                            # resize frames to a consistent resolution
+  tactile_length: 50                         # final tactile sequence length after pad/truncate
+  tactile_window: 50                         # history window pulled from the raw dataset
+  tactile_pad_value: 0.0                     # pad value when history is shorter than tactile_length
+  tactile_channels: 6                        # expected tactile channel count for input validation
+  normalize_images: true                     # scale uint8 images to [0,1] floats
+  idle_epsilon: 0.0                          # already filtered offline, no need for runtime filtering

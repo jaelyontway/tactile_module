@@ -4,7 +4,7 @@ import math
 import os
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Set, Union, Dict, List
 
 import numpy as np
 import torch
@@ -13,10 +13,10 @@ from torch.utils.data import DataLoader, Dataset
 
 try:
     from .model import MultimodalForceTransformer, MultimodalTransformerConfig
-    from .data_utils import compute_gripper_deltas
+    # from .data_utils import compute_gripper_deltas  # Not needed - data already filtered offline
 except ImportError:
     from model import MultimodalForceTransformer, MultimodalTransformerConfig
-    from data_utils import compute_gripper_deltas
+    # from data_utils import compute_gripper_deltas  # Not needed - data already filtered offline
 
 try:
     from my_dataset import ForceDataset  # type: ignore
@@ -37,7 +37,8 @@ class DummyForceDataset(Dataset):
     Synthetic dataset that mimics the real data interface.
 
     Each item returns:
-        image: (3, image_size, image_size) float tensor
+        image_left: (3, image_size, image_size) float tensor
+        image_right: (3, image_size, image_size) float tensor
         tactile: (tactile_len, 6) float tensor
         delta: scalar tensor representing the gripper delta
     """
@@ -67,25 +68,29 @@ class DummyForceDataset(Dataset):
 
     def __getitem__(self, idx: int):
         gen = self._make_generator(idx)
-        image = torch.randn(3, self.image_size, self.image_size, generator=gen)
+        image_left = torch.randn(3, self.image_size, self.image_size, generator=gen)
+        # Generate slightly different image_right for realism
+        gen_right = self._make_generator(idx + 1000)  # Different seed for right image
+        image_right = torch.randn(3, self.image_size, self.image_size, generator=gen_right)
         tactile = torch.randn(self.tactile_len, 6, generator=gen)
 
         # Simple synthetic target correlated with both modalities
-        delta = 5.0 * image.mean() + 2.0 * tactile.mean()
+        delta = 5.0 * image_left.mean() + 2.0 * tactile.mean()
         delta = delta.clamp(min=0.0)
 
-        return image.float(), tactile.float(), delta.float()
+        return image_left.float(), image_right.float(), tactile.float(), delta.float()
 
 
 class RobomimicForceDataset(Dataset):
     """Dataset wrapper for Robomimic-format HDF5 files that targets gripper deltas."""
 
-    LOGGED_DATASETS: set[str] = set()
+    LOGGED_DATASETS = set()  # type: Set[str]
 
     def __init__(
         self,
-        hdf5_path: str | Path,
+        hdf5_path: Union[str, Path],
         image_key: str,
+        image_key_right: Optional[str],
         tactile_key: str,
         gripper_key: str,
         tactile_length: int,
@@ -94,7 +99,9 @@ class RobomimicForceDataset(Dataset):
         tactile_window: Optional[int] = None,
         image_size: Optional[int] = None,
         normalize_images: bool = True,
-        idle_epsilon: Optional[float] = None,
+        action_chunk_size: int = 10,  # Number of future steps to predict
+        split: Optional[str] = None,  # "train" or "val" to filter by mask
+        # idle_epsilon: Optional[float] = None,  # Not needed - data already filtered offline
     ):
         self.hdf5_path = Path(hdf5_path).expanduser()
         if not self.hdf5_path.exists():
@@ -108,6 +115,8 @@ class RobomimicForceDataset(Dataset):
             ) from exc
 
         self.image_key = image_key
+        # If image_key_right is not provided, use image_key as fallback (for backward compatibility)
+        self.image_key_right = image_key_right if image_key_right is not None else image_key
         self.tactile_key = tactile_key
         self.gripper_key = gripper_key
         self.image_size = image_size
@@ -116,56 +125,77 @@ class RobomimicForceDataset(Dataset):
         self.tactile_length = int(tactile_length)
         self.tactile_pad_value = float(tactile_pad_value)
         self.tactile_window = int(tactile_window) if tactile_window is not None else self.tactile_length
-        self.idle_epsilon = float(idle_epsilon) if idle_epsilon not in (None, "", False) else None
+        self.action_chunk_size = int(action_chunk_size)
+        self.split = split  # "train" or "val" to filter by mask
+        # self.idle_epsilon = float(idle_epsilon) if idle_epsilon not in (None, "", False) else None
 
-        self._indices: list[tuple[str, int]] = []
-        self.filtered_idle = 0
-        self.total_candidates = 0
+        self._indices: List[Tuple[str, int]] = []
+        # self.filtered_idle = 0  # Not needed - data already filtered offline
+        # self.total_candidates = 0
         with h5py.File(self.hdf5_path, 'r') as handle:
             data_group = handle['data']
-            for episode_key in data_group.keys():
+            demo_keys = sorted(data_group.keys(), key=lambda x: int(x.split("_")[1]))
+            
+            # Get mask if available and split is specified
+            demo_mask = None
+            if self.split is not None and 'mask' in handle:
+                mask_grp = handle['mask']
+                if self.split == "train":
+                    demo_mask = np.array(mask_grp['train'])
+                elif self.split == "val":
+                    demo_mask = np.array(mask_grp['valid'])
+            
+            for i, episode_key in enumerate(demo_keys):
+                # Filter by mask if available
+                if demo_mask is not None and i < len(demo_mask):
+                    if not demo_mask[i]:
+                        continue  # Skip this demo if not in the requested split
+                
                 trajectory = data_group[episode_key]
                 gripper_dataset = np.array(self._resolve_dataset(trajectory, self.gripper_key))
                 if gripper_dataset.shape[0] < 2:
                     continue
                 horizon = gripper_dataset.shape[0] - 1
-                active_mask = None
-                if self.idle_epsilon is not None:
-                    _, active_mask = compute_gripper_deltas(gripper_dataset, epsilon=self.idle_epsilon)
-                    if active_mask.size == 0:
-                        continue
+                # active_mask = None
+                # if self.idle_epsilon is not None:
+                #     _, active_mask = compute_gripper_deltas(gripper_dataset, epsilon=self.idle_epsilon)
+                #     if active_mask.size == 0:
+                #         continue
                 for timestep in range(horizon):
-                    self.total_candidates += 1
-                    if active_mask is not None and not active_mask[timestep]:
-                        self.filtered_idle += 1
-                        continue
+                    # self.total_candidates += 1
+                    # if active_mask is not None and not active_mask[timestep]:
+                    #     self.filtered_idle += 1
+                    #     continue
                     self._indices.append((episode_key, timestep))
 
         if not self._indices:
             raise ValueError(f"No samples found in Robomimic dataset '{self.hdf5_path}'.")
-        key_signature = f"{self.hdf5_path}:{self.image_key}:{self.tactile_key}:{self.gripper_key}"
+        key_signature = f"{self.hdf5_path}:{self.image_key}:{self.image_key_right}:{self.tactile_key}:{self.gripper_key}"
         if key_signature not in self.LOGGED_DATASETS:
             episode_key, timestep = self._indices[0]
             with h5py.File(self.hdf5_path, 'r') as handle:
                 trajectory = handle['data'][episode_key]
                 image_shape = np.array(self._resolve_dataset(trajectory, self.image_key)[timestep]).shape
+                image_right_shape = np.array(self._resolve_dataset(trajectory, self.image_key_right)[timestep]).shape
                 tactile_shape = np.array(self._resolve_dataset(trajectory, self.tactile_key)).shape
                 gripper_shape = np.array(self._resolve_dataset(trajectory, self.gripper_key)).shape
-            extra = ""
+            # extra = ""
             args = [
                 self.image_key,
                 image_shape,
+                self.image_key_right,
+                image_right_shape,
                 self.tactile_key,
                 tactile_shape,
                 self.gripper_key,
                 gripper_shape,
                 len(self._indices),
             ]
-            if self.idle_epsilon is not None:
-                extra = ", filtered_idle=%d"
-                args.append(self.filtered_idle)
+            # if self.idle_epsilon is not None:
+            #     extra = ", filtered_idle=%d"
+            #     args.append(self.filtered_idle)
             logger.info(
-                "[RobomimicForceDataset] image_key='%s' shape=%s, tactile_key='%s' shape=%s, gripper_key='%s' shape=%s, kept=%d" + extra,
+                "[RobomimicForceDataset] image_key_left='%s' shape=%s, image_key_right='%s' shape=%s, tactile_key='%s' shape=%s, gripper_key='%s' shape=%s, kept=%d",
                 *args,
             )
             self.LOGGED_DATASETS.add(key_signature)
@@ -179,8 +209,9 @@ class RobomimicForceDataset(Dataset):
             node = node[key]
         return node
 
-    def _load_image(self, trajectory, timestep: int) -> torch.Tensor:
-        image_np = np.array(self._resolve_dataset(trajectory, self.image_key)[timestep])
+    def _load_image(self, trajectory, timestep: int, image_key: Optional[str] = None) -> torch.Tensor:
+        image_key_actual = image_key if image_key is not None else self.image_key
+        image_np = np.array(self._resolve_dataset(trajectory, image_key_actual)[timestep])
         if image_np.ndim != 3:
             raise ValueError(f"Expected image tensor with 3 dimensions, got shape {image_np.shape}.")
 
@@ -242,14 +273,44 @@ class RobomimicForceDataset(Dataset):
         return tactile_tensor.contiguous()
 
     def _load_gripper_delta(self, trajectory, timestep: int) -> torch.Tensor:
+        """
+        Load action chunk (future gripper deltas) for the given timestep.
+        Returns shape (action_chunk_size,) with future deltas.
+        """
         gripper_dataset = np.array(self._resolve_dataset(trajectory, self.gripper_key))
-        if timestep + 1 >= gripper_dataset.shape[0]:
-            delta = 0.0
+        
+        # Get future deltas starting from current timestep
+        remaining_steps = gripper_dataset.shape[0] - timestep
+        if remaining_steps <= 0:
+            # No future data, return zeros
+            return torch.zeros(self.action_chunk_size, dtype=torch.float32)
+        
+        # Extract future deltas (up to action_chunk_size steps)
+        future_deltas = gripper_dataset[timestep:timestep + self.action_chunk_size]
+        
+        # Reshape to (action_chunk_size,) - handle both (T, 1) and (T,) shapes
+        if future_deltas.ndim == 2:
+            future_deltas = future_deltas[:, -1]  # Take last column if (T, 1)
+        elif future_deltas.ndim == 1:
+            pass  # Already 1D
         else:
-            delta = float(gripper_dataset[timestep + 1].reshape(-1)[-1] - gripper_dataset[timestep].reshape(-1)[-1])
-        return torch.tensor(delta, dtype=torch.float32)
+            raise ValueError(f"Unexpected gripper delta shape: {future_deltas.shape}")
+        
+        # Pad with zeros if we don't have enough future steps
+        if len(future_deltas) < self.action_chunk_size:
+            padding = np.zeros(self.action_chunk_size - len(future_deltas), dtype=future_deltas.dtype)
+            future_deltas = np.concatenate([future_deltas, padding])
+        
+        # Take only action_chunk_size steps
+        future_deltas = future_deltas[:self.action_chunk_size]
+        
+        return torch.from_numpy(future_deltas).float()
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns (image_left, image_right, tactile, delta) to match model.py forward signature:
+        model(images_left, images_right, tactile)
+        """
         try:
             import h5py  # type: ignore
         except ImportError as exc:  # pragma: no cover - should already be installed
@@ -260,10 +321,11 @@ class RobomimicForceDataset(Dataset):
         episode_key, timestep = self._indices[index]
         with h5py.File(self.hdf5_path, 'r') as handle:
             trajectory = handle['data'][episode_key]
-            image = self._load_image(trajectory, timestep)
+            image_left = self._load_image(trajectory, timestep, self.image_key)
+            image_right = self._load_image(trajectory, timestep, self.image_key_right)
             tactile = self._load_tactile(trajectory, timestep)
             delta = self._load_gripper_delta(trajectory, timestep)
-        return image, tactile, delta
+        return image_left, image_right, tactile, delta
 
     def __len__(self) -> int:
         return len(self._indices)
@@ -282,8 +344,9 @@ class RegressionMetricAccumulator:
         self.sum_target_sq = 0.0
         self.sum_prod = 0.0
 
+    # what prediction and target,. what torch.Tensor do? 
     def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
-        pred_flat = prediction.detach().reshape(-1)
+        pred_flat = prediction.detach().reshape(-1) # what does detach and reshape do? 
         target_flat = target.detach().reshape(-1)
         diff = pred_flat - target_flat
 
@@ -296,7 +359,7 @@ class RegressionMetricAccumulator:
         self.sum_target_sq += target_flat.pow(2).sum().item()
         self.sum_prod += (pred_flat * target_flat).sum().item()
 
-    def results(self) -> dict[str, float]:
+    def results(self) -> Dict[str, float]:
         if self.count == 0:
             return {
                 "count": 0.0,
@@ -541,6 +604,7 @@ def train(config):
                 raise ValueError(f"Missing robomimic.{path_key} path in configuration.")
 
             image_key = dataset_cfg.get("image_key")
+            image_key_right = dataset_cfg.get("image_key_right")  # Optional, falls back to image_key if not provided
             tactile_key = dataset_cfg.get("tactile_key")
             gripper_key = dataset_cfg.get("gripper_key")
             if not image_key or not tactile_key or not gripper_key:
@@ -582,15 +646,24 @@ def train(config):
                 raise ValueError(f"Invalid robomimic.tactile_channels value: {tactile_channels_value!r}") from exc
             normalize_images = bool(dataset_cfg.get("normalize_images", True))
 
-            idle_epsilon_value = dataset_cfg.get("idle_epsilon", 0.0)
+            # Get action_chunk_size from model config or dataset config
+            model_cfg = config.get("model", {})
+            action_chunk_size = dataset_cfg.get("action_chunk_size") or model_cfg.get("action_chunk_size", 10)
             try:
-                idle_epsilon = float(idle_epsilon_value)
+                action_chunk_size = int(action_chunk_size)
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid robomimic.idle_epsilon value: {idle_epsilon_value!r}") from exc
+                raise ValueError(f"Invalid action_chunk_size value: {action_chunk_size!r}") from exc
+
+            # idle_epsilon_value = dataset_cfg.get("idle_epsilon", 0.0)
+            # try:
+            #     idle_epsilon = float(idle_epsilon_value)
+            # except (TypeError, ValueError) as exc:
+            #     raise ValueError(f"Invalid robomimic.idle_epsilon value: {idle_epsilon_value!r}") from exc
 
             dataset = RobomimicForceDataset(
                 hdf5_path=hdf5_path,
                 image_key=image_key,
+                image_key_right=image_key_right,
                 tactile_key=tactile_key,
                 gripper_key=gripper_key,
                 tactile_length=tactile_length,
@@ -599,13 +672,16 @@ def train(config):
                 tactile_window=tactile_window,
                 image_size=image_size,
                 normalize_images=normalize_images,
-                idle_epsilon=idle_epsilon,
+                action_chunk_size=action_chunk_size,
+                split=split,  # Pass split to filter by mask
+                # idle_epsilon=idle_epsilon,  # Not needed - data already filtered offline
             )
             log_once(
                 f"robomimic-{split}",
                 (
                     f"[train] Using Robomimic dataset ({split}) from {dataset.hdf5_path} "
-                    f"(image='{dataset.image_key}', tactile='{dataset.tactile_key}', gripper='{dataset.gripper_key}')"
+                    f"(image_left='{dataset.image_key}', image_right='{dataset.image_key_right}', "
+                    f"tactile='{dataset.tactile_key}', gripper='{dataset.gripper_key}')"
                 ),
             )
             return dataset
@@ -687,10 +763,16 @@ def train(config):
         grad_norm_count = 0
         grad_clip_events = 0
 
-        for images, tactile, target in train_loader:
-            images, tactile, target = images.to(device), tactile.to(device), target.to(device).float()
+        for images_left, images_right, tactile, target in train_loader:
+            images_left = images_left.to(device)
+            images_right = images_right.to(device)
+            tactile = tactile.to(device)
+            target = target.to(device).float()  # Shape: (batch, action_chunk_size)
             optimizer.zero_grad()
-            pred = model(images, tactile).squeeze(-1)
+            # model.py expects: forward(images_left, images_right, tactile)
+            # Returns: (batch, action_chunk_size)
+            pred = model(images_left, images_right, tactile)
+            # Ensure shapes match: pred and target should both be (batch, action_chunk_size)
             loss = criterion(pred, target)
             loss.backward()
 
@@ -765,9 +847,14 @@ def train(config):
 def evaluate(model, loader, criterion, device):
     model.eval()
     metrics = RegressionMetricAccumulator()
-    for images, tactile, target in loader:
-        images, tactile, target = images.to(device), tactile.to(device), target.to(device).float()
-        pred = model(images, tactile).squeeze(-1)
+    for images_left, images_right, tactile, target in loader:
+        images_left = images_left.to(device)
+        images_right = images_right.to(device)
+        tactile = tactile.to(device)
+        target = target.to(device).float()  # Shape: (batch, action_chunk_size)
+        # model.py expects: forward(images_left, images_right, tactile)
+        # Returns: (batch, action_chunk_size)
+        pred = model(images_left, images_right, tactile)
         _ = criterion(pred, target)  # keep parity with training for potential custom losses
         metrics.update(pred.detach(), target.detach())
     return metrics.results()

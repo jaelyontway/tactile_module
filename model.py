@@ -92,11 +92,21 @@ class MultimodalTransformerConfig:
 
     clip_model_name: str = "openai/clip-vit-base-patch16"
     clip_freeze_backbone: bool = True
+
     d_model: int = 256
     nhead: int = 8
-    num_layers: int = 4
+    num_layers: int = 8
     dim_feedforward: int = 512
     dropout: float = 0.1
+
+
+    # Optional masking (training-time augmentation)
+    use_masking: bool = True
+    image_mask_ratio: float = 0.5
+    tactile_mask_ratio: float = 0.3
+
+    # Action chunking
+    action_chunk_size: int = 10  # Number of future steps to predict
 
     def num_image_tokens(self) -> int:
         return self.image_token_grid * self.image_token_grid
@@ -527,11 +537,12 @@ class MultimodalForceTransformer(nn.Module):
     Typical usage:
         >>> config = MultimodalTransformerConfig()
         >>> model = MultimodalForceTransformer(config)
-        >>> images = torch.randn(4, 3, 224, 224)
+        >>> images_left = torch.randn(4, 3, 224, 224)
+        >>> images_right = torch.randn(4, 3, 224, 224)
         >>> tactile = torch.randn(4, 50, 6)
-        >>> delta_gripper = model(images, tactile)
-        >>> delta_gripper.shape
-        torch.Size([4, 1])
+        >>> action_chunk = model(images_left, images_right, tactile)
+        >>> action_chunk.shape
+        torch.Size([4, 10])  # action_chunk_size=10 by default
     """
 
     def __init__(self, config: Optional[MultimodalTransformerConfig] = None):
@@ -586,7 +597,9 @@ class MultimodalForceTransformer(nn.Module):
             self.image_resampler = None
             self.image_patch_token_count = patch_tokens_available
 
-        total_image_tokens = self.image_patch_token_count + self.num_register_tokens
+        # For two images (left + right), we double the tokens
+        total_image_tokens_per_camera = self.image_patch_token_count + self.num_register_tokens
+        total_image_tokens = total_image_tokens_per_camera * 2  # Left + Right cameras
         self.tactile_encoder = TactileEncoder1D(
             in_channels=self.config.tactile_channels,
             embed_dim=self.config.d_model,
@@ -595,6 +608,11 @@ class MultimodalForceTransformer(nn.Module):
         )
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.config.d_model))
+
+        ## Add for masking, placeholder when masking image or tactile tokens 
+        self.image_mask_token = nn.Parameter(torch.zeros(1, 1, self.config.d_model))
+        self.tactile_mask_token = nn.Parameter(torch.zeros(1, 1, self.config.d_model))
+        ##
         self.image_positional = nn.Parameter(torch.randn(1, total_image_tokens, self.config.d_model) * 0.02)
         self.tactile_positional = nn.Parameter(
             torch.randn(1, self.config.tactile_tokens, self.config.d_model) * 0.02
@@ -613,69 +631,173 @@ class MultimodalForceTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.config.num_layers)
         self.transformer_norm = nn.LayerNorm(self.config.d_model)
 
+        # Action chunking: output action_chunk_size future steps
         self.regression_head = nn.Sequential(
             nn.LayerNorm(self.config.d_model),
             nn.Linear(self.config.d_model, self.config.d_model // 2),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.d_model // 2, 1),
+            nn.Linear(self.config.d_model // 2, self.config.action_chunk_size),
         )
 
         self._init_weights()
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.image_mask_token, std=0.02)
+        nn.init.trunc_normal_(self.tactile_mask_token, std=0.02)
         for module in self.regression_head:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+    def _sample_random_mask(
+        self, batch_size: int, token_count: int, ratio: float, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """
+        Samples a boolean mask with roughly ``ratio`` of positions set to True per batch item.
+        Returns ``None`` when ``ratio <= 0`` or ``token_count == 0``.
+        """
+        # when no masking needed
+        if ratio <= 0 or token_count == 0:
+            return None
+        
+        # Compute # tokens should be masked.
+        num_to_mask = int(round(token_count * ratio))
+        # Security, make sure mask is > 0 and < token_count 
+        # token_count is the token I will hide, it can be img tokens (not include register), or tactile tokens 
+        num_to_mask = max(0, min(token_count, num_to_mask))
+
+        if num_to_mask == 0:
+            return None
+        
+        mask = torch.zeros(batch_size, token_count, dtype=torch.bool, device=device)
+        for b in range(batch_size):
+            # random shuffle tokens then pick first #num_to_mask tokens to mask
+            indices = torch.randperm(token_count, device=device)[:num_to_mask]
+            mask[b, indices] = True
+        return mask
+
+    # replaces masked tokens with a mask token
+    def _apply_mask_token(
+        self, tokens: torch.Tensor, mask: Optional[torch.Tensor], mask_token: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Replaces masked positions with a learned mask token. ``mask`` shape must be (B, L).
+        B: # batch
+        L: seequence length, e.g. patch token count (10) or tactile token count (3)
+        """
+        if mask is None:
+            return tokens
+        
+        # Make sure mask shape matches tokens shape (B, L)
+        if mask.shape != tokens.shape[:2]:
+            raise ValueError(
+                f"Mask shape must match tokens (batch, seq): expected {tokens.shape[:2]}, got {tuple(mask.shape)}"
+            )
+        
+        # If mask = False no mask positions, return original tokens
+        if not mask.any():
+            return tokens
+        
+        expanded_mask_token = mask_token.expand(tokens.size(0), tokens.size(1), -1)
+        tokens = torch.where(mask.unsqueeze(-1), expanded_mask_token, tokens)
+        return tokens
+
     def forward_features(
-        self, images: torch.Tensor, tactile: torch.Tensor
+        self, images_left: torch.Tensor, images_right: torch.Tensor, tactile: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generates token sequences for both modalities, augmented with positional encodings.
+        Processes two images (left and right wrist cameras) and concatenates their tokens.
+
+        Args:
+            images_left: Batch of left wrist camera RGB images ``(batch, 3, H, W)``.
+            images_right: Batch of right wrist camera RGB images ``(batch, 3, H, W)``.
+            tactile: Batch of tactile sequences ``(batch, 500, 6)``.
 
         Returns:
             cls_tokens: Expanded CLS token, shape ``(batch, 1, d_model)``.
-            image_tokens: Image tokens with positional encoding applied.
+            image_tokens: Concatenated image tokens from both cameras with positional encoding applied.
             tactile_tokens: Tactile tokens with positional encoding applied.
         """
-        patch_tokens, register_tokens = self.image_encoder(images)
+        batch_size = images_left.size(0)
+        
+        # Process left camera image
+        patch_tokens_left, register_tokens_left = self.image_encoder(images_left)
         if self.image_resampler is not None:
-            patch_tokens = self.image_resampler(patch_tokens)
-        if register_tokens is not None and register_tokens.numel() > 0:
-            image_tokens = torch.cat([patch_tokens, register_tokens], dim=1)
+            patch_tokens_left = self.image_resampler(patch_tokens_left)
+        if self.config.use_masking and self.training:
+            image_mask_left = self._sample_random_mask(
+                batch_size=batch_size,
+                token_count=patch_tokens_left.size(1),
+                ratio=self.config.image_mask_ratio,
+                device=patch_tokens_left.device,
+            )
+            patch_tokens_left = self._apply_mask_token(patch_tokens_left, image_mask_left, self.image_mask_token)
+        if register_tokens_left is not None and register_tokens_left.numel() > 0:
+            image_tokens_left = torch.cat([patch_tokens_left, register_tokens_left], dim=1)
         else:
-            image_tokens = patch_tokens
+            image_tokens_left = patch_tokens_left
+
+        # Process right camera image
+        patch_tokens_right, register_tokens_right = self.image_encoder(images_right)
+        if self.image_resampler is not None:
+            patch_tokens_right = self.image_resampler(patch_tokens_right)
+        if self.config.use_masking and self.training:
+            image_mask_right = self._sample_random_mask(
+                batch_size=batch_size,
+                token_count=patch_tokens_right.size(1),
+                ratio=self.config.image_mask_ratio,
+                device=patch_tokens_right.device,
+            )
+            patch_tokens_right = self._apply_mask_token(patch_tokens_right, image_mask_right, self.image_mask_token)
+        if register_tokens_right is not None and register_tokens_right.numel() > 0:
+            image_tokens_right = torch.cat([patch_tokens_right, register_tokens_right], dim=1)
+        else:
+            image_tokens_right = patch_tokens_right
+
+        # Concatenate tokens from both cameras: [left_tokens, right_tokens]
+        image_tokens = torch.cat([image_tokens_left, image_tokens_right], dim=1)
 
         if image_tokens.size(1) != self.image_positional.size(1):
             raise ValueError(
                 f"Image token count mismatch (expected {self.image_positional.size(1)}, got {image_tokens.size(1)})."
             )
         image_tokens = image_tokens + self.image_positional
-        tactile_tokens = self.tactile_encoder(tactile) + self.tactile_positional
+        
+        tactile_tokens = self.tactile_encoder(tactile)
+        if self.config.use_masking and self.training:
+            tactile_mask = self._sample_random_mask(
+                batch_size=batch_size,
+                token_count=tactile_tokens.size(1),
+                ratio=self.config.tactile_mask_ratio,
+                device=tactile_tokens.device,
+            )
+            tactile_tokens = self._apply_mask_token(tactile_tokens, tactile_mask, self.tactile_mask_token)
+        tactile_tokens = tactile_tokens + self.tactile_positional
 
-        batch_size = images.size(0)
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
 
         return cls_tokens, image_tokens, tactile_tokens
 
     def forward(
-        self, images: torch.Tensor, tactile: torch.Tensor, return_tokens: bool = False
+        self, images_left: torch.Tensor, images_right: torch.Tensor, tactile: torch.Tensor, return_tokens: bool = False
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            images: Batch of RGB images ``(batch, 3, H, W)``.
+            images_left: Batch of left wrist camera RGB images ``(batch, 3, H, W)``.
+            images_right: Batch of right wrist camera RGB images ``(batch, 3, H, W)``.
             tactile: Batch of tactile sequences ``(batch, 500, 6)``.
             return_tokens: When ``True``, the method also returns the fused token sequence.
 
         Returns:
-            delta_gripper: Regression output ``(batch, 1)`` representing the gripper delta.
+            action_chunk: Regression output ``(batch, action_chunk_size)`` representing gripper position deltas
+                for the next ``action_chunk_size`` future steps.
             tokens (optional): Token sequence after the transformer ``(batch, total_tokens, d_model)``.
         """
-        cls_tokens, image_tokens, tactile_tokens = self.forward_features(images, tactile)
+        cls_tokens, image_tokens, tactile_tokens = self.forward_features(images_left, images_right, tactile)
         tokens = torch.cat([cls_tokens, image_tokens, tactile_tokens], dim=1)
         tokens = self.modal_dropout(tokens)
 
@@ -683,11 +805,11 @@ class MultimodalForceTransformer(nn.Module):
         fused = self.transformer_norm(fused)
 
         cls_output = fused[:, 0, :]
-        delta_gripper = self.regression_head(cls_output)
+        action_chunk = self.regression_head(cls_output)
 
         if return_tokens:
-            return delta_gripper, fused
-        return delta_gripper
+            return action_chunk, fused
+        return action_chunk
 
 
 __all__ = [
