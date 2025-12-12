@@ -16,7 +16,7 @@ sudo chmod 666 /dev/ttyACM0 # give access to tactile sensing
 cd /home/pi0/multi-modal/droid-multi-modal/scripts
 python jaelyn_demo.py
 ```
-Make sure there is no error with keyword "Gripper" and then continue data collection on GUI
+Make sure there is no error with keyword "Gripper" in Terminal 1 and then continue data collection on GUI
 
 ## Data Collection GUI
 rename as your preference 
