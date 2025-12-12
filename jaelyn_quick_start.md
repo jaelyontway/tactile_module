@@ -16,11 +16,13 @@ sudo chmod 666 /dev/ttyACM0 # give access to tactile sensing
 cd /home/pi0/multi-modal/droid-multi-modal/scripts
 python jaelyn_demo.py
 ```
+Make sure there is no error with keyword "Gripper" and then continue data collection on GUI
+
 ## Data Collection GUI
 rename as your preference 
 type in prompt 
 Calibrate as needed, the calibration board is on the messy table 
-Collect --> Proceed (tactile sensor reinitiaze everytime this button got hit) --> Press keyboard 'a' --> Press keyboard 'e' --> If save this demo, press keyboard 'a"; if discard this demo, press keyboard 's' --> Proceed --> ...
+Collect --> Proceed (tactile sensor reinitiaze everytime this button got hit) --> Press keyboard 'a' --> Press keyboard 'e' --> If save this demo, press keyboard 'a"; if discard this demo, press keyboard 's' --> Back --> Proceed --> ...
 
 
 ## Data Store here 
